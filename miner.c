@@ -5976,6 +5976,11 @@ static void stage_work(struct work *work)
 	work->work_restart_id = work->pool->work_restart_id;
 	work->pool->last_work_time = time(NULL);
 	cgtime(&work->pool->tv_last_work_time);
+	
+	// this is needed for cgminer to work with Mediterraneancoin
+	work->mandatory = true;
+	//	
+	
 	test_work_current(work);
 	work->pool->works++;
 	hash_push(work);
