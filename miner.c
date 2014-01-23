@@ -5239,13 +5239,17 @@ bool stale_work(struct work *work, bool share)
 	if (work_expiry > max_expiry)
 		work_expiry = max_expiry;
 
+
+
 	if (share) {
+#ifdef _DO_NOT_USE_
 		/* If the share isn't on this pool's latest block, it's stale */
 		if (pool->block_id && pool->block_id != block_id)
 		{
 			applog(LOG_DEBUG, "Share stale due to block mismatch (%08lx != %08lx)", (long)block_id, (long)pool->block_id);
 			return true;
 		}
+#endif
 
 		/* If the pool doesn't want old shares, then any found in work before
 		 * the most recent longpoll is stale */
@@ -5255,6 +5259,7 @@ bool stale_work(struct work *work, bool share)
 			return true;
 		}
 	} else {
+#ifdef _DO_NOT_USE_
 		/* If this work isn't for the latest Bitcoin block, it's stale */
 		/* But only care about the current pool if failover-only */
 		if (enabled_pools <= 1 || opt_fail_only) {
@@ -5270,6 +5275,7 @@ bool stale_work(struct work *work, bool share)
 				return true;
 			}
 		}
+#endif
 
 		/* If the pool has asked us to restart since this work, it's stale */
 		if (work->work_restart_id != pool->work_restart_id)
@@ -5277,6 +5283,8 @@ bool stale_work(struct work *work, bool share)
 			applog(LOG_DEBUG, "Work stale due to work update (%02x != %02x)", work->work_restart_id, pool->work_restart_id);
 			return true;
 		}
+
+
 
 	if (pool->has_stratum && work->job_id) {
 		bool same_job;
