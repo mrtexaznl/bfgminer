@@ -900,6 +900,28 @@ static pthread_mutex_t noncelog_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *noncelog_file = NULL;
 
 static
+void debugWork(const struct work * const work) 
+{
+
+	const int thr_id = work->thr_id;
+	const struct cgpu_info *proc = get_thr_cgpu(thr_id);
+	char buf[0x200], hash[65], data[161], midstate[65], hybridsch256_data[161];
+	int rv;
+	size_t ret;
+	
+	bin2hex(hash, work->hash, 32);
+	bin2hex(data, work->data, 80);
+	bin2hex(hybridsch256_data, work->hybridsch256_data, 80);
+	bin2hex(midstate, work->midstate, 32);
+	
+	// timestamp,proc,hash,data,midstate,hybridsch256_data
+	printf("%lu,%s,%s,%s,%s,%s\n",
+	              (unsigned long)time(NULL), proc->proc_repr_ns,
+	              hash, data, midstate, hybridsch256_data);
+	
+}
+
+static
 void noncelog(const struct work * const work)
 {
 	const int thr_id = work->thr_id;
@@ -2775,7 +2797,10 @@ static bool work_decode(struct pool *pool, struct work *work, json_t *val)
 
         // void hybridScryptHash256(const char *input, char *output);
 	applog(LOG_DEBUG, "STAGE1");
-	hybridScryptHash256(work->data, work->data);
+	debugWork(work);
+	hybridScryptHash256Stage1(work);
+	applog(LOG_DEBUG, "STAGE1 - after hybridScryptHash256Stage1");
+	debugWork(work);
 
 	//if (!jobj_binary(res_val, "midstate", work->midstate, sizeof(work->midstate), false)) {
 		// Calculate it ourselves
@@ -4217,6 +4242,11 @@ static char *submit_upstream_work_request(struct work *work)
 		unsigned char data[80];
 
 		//STAGE2
+		applog(LOG_DEBUG, "STAGE2(1)");
+		debugWork(work);
+		hybridScryptHash256Stage2(work);
+		applog(LOG_DEBUG, "STAGE2(1) - after hybridScryptHash256Stage2");
+		debugWork(work);
 		
 		swap32yes(data, work->data, 80 / 4);
 #if BLKMAKER_VERSION > 3
@@ -4232,6 +4262,11 @@ static char *submit_upstream_work_request(struct work *work)
 	} else {
 
 		//STAGE2 
+		applog(LOG_DEBUG, "STAGE2(2)");
+		debugWork(work);
+		hybridScryptHash256Stage2(work);
+		applog(LOG_DEBUG, "STAGE2(2) - after hybridScryptHash256Stage2");
+		debugWork(work);
 
 		// already byte swapped here??
 

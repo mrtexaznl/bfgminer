@@ -1216,9 +1216,9 @@ void hybridScryptHash256Stage2(struct work *work) {
 	for (size_t i = 0; i < 32; i++)
 		output[i] = s256.begin()[i] ^ maskedSc256[i];
 
-	// restore work->data
-	memcpy(work->hybridsch256_data, work->data, 68 * sizeof(char));	
-
+	// restore to work->data
+	memcpy(work->data, work->hybridsch256_data, 68 * sizeof(char));	
+ 	
 }
 
 void hybridScryptHash256(const char *input, char *output) {
