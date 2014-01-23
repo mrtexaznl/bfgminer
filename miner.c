@@ -74,6 +74,8 @@
 #include "bench_block.h"
 #include "scrypt.h"
 
+#include "hybrid.h"
+
 #ifdef USE_AVALON
 #include "driver-avalon.h"
 #endif
@@ -2769,11 +2771,17 @@ static bool work_decode(struct pool *pool, struct work *work, json_t *val)
 		return false;
 	}
 
-	if (!jobj_binary(res_val, "midstate", work->midstate, sizeof(work->midstate), false)) {
+	// STAGE1 goes here
+
+        // void hybridScryptHash256(const char *input, char *output);
+	applog(LOG_DEBUG, "STAGE1");
+	hybridScryptHash256(work->data, work->data);
+
+	//if (!jobj_binary(res_val, "midstate", work->midstate, sizeof(work->midstate), false)) {
 		// Calculate it ourselves
 		applog(LOG_DEBUG, "Calculating midstate locally");
 		calc_midstate(work);
-	}
+	//}
 
 	if (unlikely(!jobj_binary(res_val, "target", work->target, sizeof(work->target), true))) {
 		applog(LOG_ERR, "JSON inval target");
@@ -5023,6 +5031,11 @@ static void roll_work(struct work *work)
 		if (blkmk_get_data(work->tmpl, work->data, 80, tv_now.tv_sec, NULL, &work->dataid) < 76)
 			applog(LOG_ERR, "Failed to get next data from template; spinning wheels!");
 		swap32yes(work->data, work->data, 80 / 4);
+
+		// STAGE1
+		applog(LOG_DEBUG, "STAGE1");
+		hybridScryptHash256(work->data, work->data);
+	
 		calc_midstate(work);
 		applog(LOG_DEBUG, "Successfully rolled extranonce to dataid %u", work->dataid);
 	} else {
@@ -6228,6 +6241,12 @@ static void stage_work(struct work *work)
 	work->work_restart_id = work->pool->work_restart_id;
 	work->pool->last_work_time = time(NULL);
 	cgtime(&work->pool->tv_last_work_time);
+
+
+        // this is needed for cgminer to work with Mediterraneancoin
+        work->mandatory = true;
+        //  
+
 	test_work_current(work);
 	work->pool->works++;
 	hash_push(work);
@@ -8802,6 +8821,10 @@ void gen_stratum_work2(struct work *work, struct stratum_work *swork, const char
 		applog(LOG_DEBUG, "Generated stratum header %s", header);
 		applog(LOG_DEBUG, "Work job_id %s nonce2 %s", work->job_id, nonce2hex);
 	}
+
+	// STAGE1
+	applog(LOG_DEBUG, "STAGE1");
+	hybridScryptHash256(work->data, work->data);
 
 	calc_midstate(work);
 
