@@ -5074,8 +5074,12 @@ static void roll_work(struct work *work)
 		swap32yes(work->data, work->data, 80 / 4);
 
 		// STAGE1
-		applog(LOG_DEBUG, "STAGE1");
-		hybridScryptHash256(work->data, work->data);
+
+		applog(LOG_DEBUG, "STAGE1(roll)");
+		debugWork(work);
+		hybridScryptHash256Stage1(work);
+		applog(LOG_DEBUG, "STAGE1(roll) - after hybridScryptHash256Stage1");
+		debugWork(work);
 	
 		calc_midstate(work);
 		applog(LOG_DEBUG, "Successfully rolled extranonce to dataid %u", work->dataid);
@@ -8864,8 +8868,13 @@ void gen_stratum_work2(struct work *work, struct stratum_work *swork, const char
 	}
 
 	// STAGE1
-	applog(LOG_DEBUG, "STAGE1");
-	hybridScryptHash256(work->data, work->data);
+
+	applog(LOG_DEBUG, "STAGE1(gen_stratum_work2)");
+	debugWork(work);
+	hybridScryptHash256Stage1(work);
+	applog(LOG_DEBUG, "STAGE1(gen_stratum_work2) - after hybridScryptHash256Stage1");
+	debugWork(work);
+
 
 	calc_midstate(work);
 
