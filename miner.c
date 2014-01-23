@@ -915,7 +915,7 @@ void debugWork(const struct work * const work)
 	bin2hex(midstate, work->midstate, 32);
 	
 	// timestamp,proc,hash,data,midstate,hybridsch256_data
-	printf("%lu,%s,%s,%s,%s\n",
+	printf("%lu,%s\n%s\n%s\n%s\n",
 	              (unsigned long)time(NULL), 
 	              hash, data, midstate, hybridsch256_data);
 	
