@@ -4215,6 +4215,8 @@ static char *submit_upstream_work_request(struct work *work)
 	if (work->tmpl) {
 		json_t *req;
 		unsigned char data[80];
+
+		//STAGE2
 		
 		swap32yes(data, work->data, 80 / 4);
 #if BLKMAKER_VERSION > 3
@@ -4228,6 +4230,10 @@ static char *submit_upstream_work_request(struct work *work)
 		sd = malloc(161);
 		bin2hex(sd, data, 80);
 	} else {
+
+		//STAGE2 
+
+		// already byte swapped here??
 
 	/* build hex string */
 		hexstr = malloc((sizeof(work->data) * 2) + 1);

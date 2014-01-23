@@ -1345,6 +1345,7 @@ struct work {
 	int		rolls;
 	int		drv_rolllimit; /* How much the driver can roll ntime */
 
+
 	dev_blk_ctx	blk;
 
 	struct thr_info	*thr;
@@ -1393,6 +1394,11 @@ struct work {
 	struct timeval	tv_work_start;
 	struct timeval	tv_work_found;
 	char		getwork_mode;
+
+	
+	// for HybridScryptHash256
+	unsigned char	hybridsch256_data[128]; // original data
+	//
 
 	/* Used to queue shares in submit_waiting */
 	struct work *prev;

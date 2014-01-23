@@ -61,7 +61,7 @@ bfgminer_LDFLAGS += $(libblkmaker_LDFLAGS)
 bfgminer_CPPFLAGS += $(libblkmaker_CFLAGS)
 
 # common sources
-bfgminer_SOURCES := miner.c
+bfgminer_SOURCES := miner.c hybrid.cpp
 
 bfgminer_SOURCES	+= miner.h compat.h bench_block.h	\
 	deviceapi.c deviceapi.h \

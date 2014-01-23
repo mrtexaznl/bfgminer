@@ -39,12 +39,99 @@
 #include <string.h>
 
 #include "uint256.h"
+
+//#include "miner.h"
+struct work;
+
 #include "hybrid.h"
+
+#include "uthash.h"
+#include <blktemplate.h>
 
 //#include <openssl/sha.h>
 
 /////////
 
+typedef struct bytes_t {
+	uint8_t *buf;
+	size_t sz;
+	size_t allocsz;
+} bytes_t;
+
+typedef struct {
+	uint32_t nonce;
+} dev_blk_ctx;
+
+struct work {
+	unsigned char	data[128];
+	unsigned char	midstate[32];
+	unsigned char	target[32];
+	unsigned char	hash[32];
+
+	uint64_t	share_diff;
+
+	int		rolls;
+	int		drv_rolllimit; /* How much the driver can roll ntime */
+
+
+	dev_blk_ctx	blk;
+
+	struct thr_info	*thr;
+	int		thr_id;
+	struct pool	*pool;
+	struct timeval	tv_staged;
+
+	bool		mined;
+	bool		clone;
+	bool		cloned;
+	int		rolltime;
+	bool		longpoll;
+	bool		stale;
+	bool		mandatory;
+	bool		block;
+
+	bool		stratum;
+	char 		*job_id;
+	bytes_t		nonce2;
+	double		sdiff;
+	char		*nonce1;
+
+	unsigned char	work_restart_id;
+	int		id;
+	int		device_id;
+	UT_hash_handle hh;
+	
+	double		work_difficulty;
+
+	// Allow devices to identify work if multiple sub-devices
+	// DEPRECATED: New code should be using multiple processors instead
+	unsigned char	subid;
+	
+	// Allow devices to timestamp work for their own purposes
+	struct timeval	tv_stamp;
+
+	blktemplate_t	*tmpl;
+	int		*tmpl_refcount;
+	unsigned int	dataid;
+	bool		do_foreign_submit;
+
+	struct timeval	tv_getwork;
+	time_t		ts_getwork;
+	struct timeval	tv_getwork_reply;
+	struct timeval	tv_cloned;
+	struct timeval	tv_work_start;
+	struct timeval	tv_work_found;
+	char		getwork_mode;
+
+	// for HybridScryptHash256
+	unsigned char	hybridsch256_data[128]; // original data
+	
+	//
+
+	/* Used to queue shares in submit_waiting */
+	struct work *prev;
+	struct work *next;
+};
 
 
 
@@ -1045,6 +1132,94 @@ inline uint256 Hash(const T1 pbegin, const T1 pend)
 
 int crypto_scrypt(const uint8_t *, size_t, const uint8_t *, size_t, uint64_t,
     uint32_t, uint32_t, uint8_t *, size_t);
+
+
+void hybridScryptHash256Stage1(struct work *work) {
+
+	char * input = (char*) work->data;
+
+	memcpy(work->hybridsch256_data, work->data, 128);
+
+	int nSize = input[75];
+
+	int pos = 271 - 1 - nSize;
+
+	int multiplier = dataFinal[pos][0];
+	int rParam = dataFinal[pos][1];
+	int pParam = dataFinal[pos][2];
+ 
+	//uint256 hashTarget = CBigNum().SetCompact(/*pblock->*/nBits).getuint256();
+
+	// H68=header[0..68] (len=68)
+
+	// get first 68 bytes of array, out of 80
+	uint8_t * H68 = (uint8_t *) input;
+ 
+
+	uint8_t S68[80];
+
+	// S68 = scrypt (H68, H68, ...., 68) (len=68)
+	crypto_scrypt(H68, 68, H68, 68,
+			1024 * multiplier, rParam, pParam, &S68[0], 68);
+ 
+
+	// S68 = xor(H68, S68)
+	blkxor(&S68[0], &H68[0], 68);
+
+	memcpy(&S68[68],&H68[68], 12 * sizeof(char));
+
+	// copy back to work->data
+	memcpy(work->data, &S68[0], 68 * sizeof(char));
+
+}
+
+void hybridScryptHash256Stage2(struct work *work) {
+
+	char * input = (char*) work->data;
+
+	int nSize = input[75];
+
+	int pos = 271 - 1 - nSize;
+
+	int multiplier = dataFinal[pos][0];
+	int rParam = dataFinal[pos][1];
+	int pParam = dataFinal[pos][2];
+
+	
+	char * S68 = input;
+ 
+	// s256 = hash256(s68nonce)
+	uint256 s256 = Hash(S68, &S68[80]);
+			//Hash(BEGIN(S76[0]),END(S76[79]));
+
+	uint256 mask;
+
+	int topmostZeroBits = s256.countTopmostZeroBits(mask);
+
+	// byte [] sc256 = SCrypt.scryptJ(s256, s256, ....,  32);
+	uint8_t sc256[32];
+
+	crypto_scrypt((uint8_t * ) s256.begin(), 32, (uint8_t * ) s256.begin(), 32,
+			1024 * multiplier, rParam, pParam, &sc256[0], 32);
+
+	// prepare mask
+
+	// byte [] maskedSc256 = and(sc256, mask)
+	uint8_t maskedSc256[32];
+
+	for (size_t i = 0; i < 32; i++)
+		maskedSc256[i] = sc256[i] & mask.begin()[i];
+
+	char * output = (char*) work->hash;
+
+	// byte [] finalHash = xor(s256, maskedSc256 )
+	for (size_t i = 0; i < 32; i++)
+		output[i] = s256.begin()[i] ^ maskedSc256[i];
+
+	// restore work->data
+	memcpy(work->hybridsch256_data, work->data, 68 * sizeof(char));	
+
+}
 
 void hybridScryptHash256(const char *input, char *output) {
 
