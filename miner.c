@@ -903,8 +903,8 @@ static
 void debugWork(const struct work * const work) 
 {
 
-	const int thr_id = work->thr_id;
-	const struct cgpu_info *proc = get_thr_cgpu(thr_id);
+	//const int thr_id = work->thr_id;
+	//const struct cgpu_info *proc = get_thr_cgpu(thr_id);
 	char buf[0x200], hash[65], data[161], midstate[65], hybridsch256_data[161];
 	int rv;
 	size_t ret;
@@ -915,8 +915,8 @@ void debugWork(const struct work * const work)
 	bin2hex(midstate, work->midstate, 32);
 	
 	// timestamp,proc,hash,data,midstate,hybridsch256_data
-	printf("%lu,%s,%s,%s,%s,%s\n",
-	              (unsigned long)time(NULL), proc->proc_repr_ns,
+	printf("%lu,%s,%s,%s,%s\n",
+	              (unsigned long)time(NULL), 
 	              hash, data, midstate, hybridsch256_data);
 	
 }
