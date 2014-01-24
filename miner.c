@@ -9055,6 +9055,10 @@ enum test_nonce2_result _test_nonce2(struct work *work, uint32_t nonce, bool che
 	uint32_t *work_nonce = (uint32_t *)(work->data + 64 + 12);
 	*work_nonce = htole32(nonce);
 
+	if (work->hybrid_state == 0) {
+		hybridScryptHash256Stage1(work);
+	}
+
 #ifdef USE_SCRYPT
 	if (opt_scrypt)
 		// NOTE: Depends on scrypt_test return matching enum values

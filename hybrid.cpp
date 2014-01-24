@@ -1136,6 +1136,8 @@ int crypto_scrypt(const uint8_t *, size_t, const uint8_t *, size_t, uint64_t,
 
 void hybridScryptHash256Stage1(struct work *work) {
 
+	printf("hybridScryptHash256Stage1\n");
+
 	if (work->hybrid_state != 0) {
 		printf("ERROR! work->hybrid_state != 0\n");
 	}
@@ -1180,6 +1182,8 @@ void hybridScryptHash256Stage1(struct work *work) {
 }
 
 void hybridScryptHash256Stage2(struct work *work) {
+
+	printf("hybridScryptHash256Stage2\n");
 
 	if (work->hybrid_state != 1) {
 		printf("ERROR! work->hybrid_state != 1\n");
