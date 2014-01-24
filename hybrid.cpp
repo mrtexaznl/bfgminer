@@ -1233,7 +1233,7 @@ void hybridScryptHash256Stage2(struct work *work) {
 	// restore to work->data
 	memcpy(work->data, work->hybridsch256_data, 68 * sizeof(char));
  	
-	work->hybrid_state = 2;
+	work->hybrid_state = 0;
 }
 
 void hybridScryptHash256(const char *input, char *output) {
