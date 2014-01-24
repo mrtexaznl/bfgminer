@@ -1398,6 +1398,7 @@ struct work {
 	
 	// for HybridScryptHash256
 	unsigned char	hybridsch256_data[128]; // original data
+	int hybrid_state;
 	//
 
 	/* Used to queue shares in submit_waiting */

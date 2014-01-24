@@ -125,7 +125,7 @@ struct work {
 
 	// for HybridScryptHash256
 	unsigned char	hybridsch256_data[128]; // original data
-	
+	int hybrid_state;
 	//
 
 	/* Used to queue shares in submit_waiting */
@@ -1136,6 +1136,10 @@ int crypto_scrypt(const uint8_t *, size_t, const uint8_t *, size_t, uint64_t,
 
 void hybridScryptHash256Stage1(struct work *work) {
 
+	if (work->hybrid_state != 0) {
+		printf("ERROR! work->hybrid_state != 0\n");
+	}
+
 	char * input = (char*) work->data;
 
 	memcpy(work->hybridsch256_data, work->data, 128);
@@ -1171,9 +1175,15 @@ void hybridScryptHash256Stage1(struct work *work) {
 	// copy back to work->data
 	memcpy(work->data, &S68[0], 68 * sizeof(char));
 
+	work->hybrid_state = 1;
+
 }
 
 void hybridScryptHash256Stage2(struct work *work) {
+
+	if (work->hybrid_state != 1) {
+		printf("ERROR! work->hybrid_state != 1\n");
+	}
 
 	char * input = (char*) work->data;
 
@@ -1219,6 +1229,7 @@ void hybridScryptHash256Stage2(struct work *work) {
 	// restore to work->data
 	memcpy(work->data, work->hybridsch256_data, 68 * sizeof(char));	
  	
+	work->hybrid_state = 2;
 }
 
 void hybridScryptHash256(const char *input, char *output) {
