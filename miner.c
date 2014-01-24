@@ -9048,11 +9048,11 @@ enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
 
 	debugWork(work);
 
-	if (hash2_32[7] != 0) {
+	/*if (hash2_32[7] != 0) {
 		printf("hashtest2 - TNR_BAD\n");
 
 		return TNR_BAD;
-	}
+	}*/
 
 	if (!checktarget) {
 		printf("hashtest2 - TNR_GOOD\n");
