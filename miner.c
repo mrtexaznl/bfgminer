@@ -9045,21 +9045,21 @@ enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
 	}
 
 	if (hash2_32[7] != 0) {
-		printf("hashtest2 - \n");
+		printf("hashtest2 - TNR_BAD\n");
 		return TNR_BAD;
 	}
 
 	if (!checktarget) {
-		printf("hashtest2 - \n");
+		printf("hashtest2 - TNR_GOOD\n");
 		return TNR_GOOD;
 	}
 
 	if (!hash_target_check_v(work->hash, work->target)) {
-		printf("hashtest2 - \n");
+		printf("hashtest2 - TNR_HIGH\n");
 		return TNR_HIGH;
 	}
 
-	printf("hashtest2 - \n");
+	printf("hashtest2 - TNR_GOOD\n");
 	return TNR_GOOD;
 }
 
