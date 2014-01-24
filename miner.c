@@ -8878,9 +8878,26 @@ void gen_stratum_work2(struct work *work, struct stratum_work *swork, const char
 	// STAGE1
 
 	applog(LOG_DEBUG, "STAGE1(gen_stratum_work2)");
+
+	applog(LOG_DEBUG, "before swap32yes");
 	debugWork(work);
+
+	//swap32yes(&data.i[0], work->data, 16);
+	swap32yes(work->data, work->data, 20);
+
+	applog(LOG_DEBUG, "after swap32yes");
+	debugWork(work);
+
 	hybridScryptHash256Stage1(work);
+
 	applog(LOG_DEBUG, "STAGE1(gen_stratum_work2) - after hybridScryptHash256Stage1");
+
+	applog(LOG_DEBUG, "before swap32yes");
+	debugWork(work);
+
+	swap32yes(work->data, work->data, 20);
+
+	applog(LOG_DEBUG, "after swap32yes");
 	debugWork(work);
 
 
@@ -9043,7 +9060,9 @@ enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
 	debugWork(work);
 
 	if (work->hybrid_state == 1) {
+		swap32yes(work->data, work->data, 20);
 		hybridScryptHash256Stage2(work);
+		swap32yes(work->data, work->data, 20);
 	}
 
 	debugWork(work);
@@ -9077,7 +9096,9 @@ enum test_nonce2_result _test_nonce2(struct work *work, uint32_t nonce, bool che
 	*work_nonce = htole32(nonce);
 
 	if (work->hybrid_state == 0) {
+		swap32yes(work->data, work->data, 20);
 		hybridScryptHash256Stage1(work);
+		swap32yes(work->data, work->data, 20);
 	}
 
 #ifdef USE_SCRYPT
