@@ -32,11 +32,12 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-
+#include <sys/time.h>
+#include <time.h>
 
 
 #include <errno.h>
-#include <string.h>
+//#include <string.h>
 
 #include "uint256.h"
 

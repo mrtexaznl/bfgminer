@@ -902,6 +902,8 @@ static FILE *noncelog_file = NULL;
 static
 void debugWork(const struct work * const work) 
 {
+	if (!opt_debug_console)
+		return;
 
 	//const int thr_id = work->thr_id;
 	//const struct cgpu_info *proc = get_thr_cgpu(thr_id);
