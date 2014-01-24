@@ -9040,12 +9040,17 @@ enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
 
 	hash_data(work->hash, work->data);
 
+	debugWork(work);
+
 	if (work->hybrid_state == 1) {
 		hybridScryptHash256Stage2(work);
 	}
 
+	debugWork(work);
+
 	if (hash2_32[7] != 0) {
 		printf("hashtest2 - TNR_BAD\n");
+
 		return TNR_BAD;
 	}
 
