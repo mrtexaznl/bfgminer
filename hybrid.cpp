@@ -1139,7 +1139,7 @@ void hybridScryptHash256Stage1(struct work *work) {
 	printf("hybridScryptHash256Stage1\n");
 
 	if (work->hybrid_state != 0) {
-		printf("ERROR! work->hybrid_state != 0\n");
+		printf("ERROR! work->hybrid_state != 0, %i \n", work->hybrid_state);
 	}
 
 	char * input = (char*) work->data;
@@ -1186,7 +1186,7 @@ void hybridScryptHash256Stage2(struct work *work) {
 	printf("hybridScryptHash256Stage2\n");
 
 	if (work->hybrid_state != 1) {
-		printf("ERROR! work->hybrid_state != 1\n");
+		printf("ERROR! work->hybrid_state != 1, %i \n", work->hybrid_state);
 	}
 
 	char * input = (char*) work->data;
@@ -1231,7 +1231,7 @@ void hybridScryptHash256Stage2(struct work *work) {
 		output[i] = s256.begin()[i] ^ maskedSc256[i];
 
 	// restore to work->data
-	//memcpy(work->data, work->hybridsch256_data, 68 * sizeof(char));
+	memcpy(work->data, work->hybridsch256_data, 68 * sizeof(char));
  	
 	work->hybrid_state = 2;
 }
