@@ -9055,7 +9055,8 @@ enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
 {
 	uint32_t *hash2_32 = (uint32_t *)&work->hash[0];
 
-	printf("hashtest2\n");
+	if (opt_debug_console)
+	   printf("hashtest2\n");
 
 	hash_data(work->hash, work->data);
 
@@ -9071,28 +9072,36 @@ enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
 
 
 	if (hash2_32[7] != 0) {
-		printf("hashtest2 - TNR_BAD\n");
+		if (opt_debug_console)
+		   printf("hashtest2 - TNR_BAD\n");
 
 		return TNR_BAD;
 	}
 
 	if (!checktarget) {
-		printf("hashtest2 - TNR_GOOD\n");
+		if (opt_debug_console)
+			printf("hashtest2 - TNR_GOOD\n");
+
 		return TNR_GOOD;
 	}
 
 	if (!hash_target_check_v(work->hash, work->target)) {
-		printf("hashtest2 - TNR_HIGH\n");
+		if (opt_debug_console)
+		   printf("hashtest2 - TNR_HIGH\n");
+
 		return TNR_HIGH;
 	}
 
-	printf("hashtest2 - TNR_GOOD\n");
+	if (opt_debug_console)
+	   printf("hashtest2 - TNR_GOOD\n");
+
 	return TNR_GOOD;
 }
 
 enum test_nonce2_result _test_nonce2(struct work *work, uint32_t nonce, bool checktarget)
 {
-	printf("_test_nonce2\n");
+	if (opt_debug_console)
+	   printf("_test_nonce2\n");
 
 	uint32_t *work_nonce = (uint32_t *)(work->data + 64 + 12);
 	*work_nonce = htole32(nonce);
