@@ -48,9 +48,16 @@
 #ifndef WIN32
 #include <sys/resource.h>
 #include <sys/socket.h>
+#if defined(HAVE_LIBUDEV) && defined(HAVE_SYS_EPOLL_H)
+#include <libudev.h>
+#include <sys/epoll.h>
+#define HAVE_BFG_HOTPLUG
+#endif
 #else
 #include <winsock2.h>
 #include <windows.h>
+#include <dbt.h>
+#define HAVE_BFG_HOTPLUG
 #endif
 #include <ccan/opt/opt.h>
 #include <jansson.h>
@@ -67,11 +74,9 @@
 #include "deviceapi.h"
 #include "logging.h"
 #include "miner.h"
-#include "findnonce.h"
 #include "adl.h"
 #include "driver-cpu.h"
 #include "driver-opencl.h"
-#include "bench_block.h"
 #include "scrypt.h"
 
 #include "hybrid.h"
@@ -97,6 +102,14 @@
 #if defined(USE_AVALON) || defined(USE_BITFORCE) || defined(USE_ICARUS) || defined(USE_MODMINER) || defined(USE_NANOFURY) || defined(USE_X6500) || defined(USE_ZTEX)
 #	define USE_FPGA
 #endif
+
+enum bfg_quit_summary {
+	BQS_DEFAULT,
+	BQS_NONE,
+	BQS_DEVS,
+	BQS_PROCS,
+	BQS_DETAILED,
+};
 
 struct strategies strategies[] = {
 	{ "Failover" },
@@ -125,6 +138,8 @@ static uint32_t template_nonce;
 #if BLKMAKER_VERSION > 0
 char *opt_coinbase_sig;
 #endif
+static enum bfg_quit_summary opt_quit_summary = BQS_DEFAULT;
+static bool include_serial_in_statline;
 char *request_target_str;
 float request_pdiff = 1.0;
 double request_bdiff;
@@ -143,7 +158,7 @@ const int opt_cutofftemp = 95;
 int opt_hysteresis = 3;
 static int opt_retries = -1;
 int opt_fail_pause = 5;
-int opt_log_interval = 5;
+int opt_log_interval = 20;
 int opt_queue = 1;
 int opt_scantime = 60;
 int opt_expiry = 120;
@@ -152,6 +167,7 @@ int opt_bench_algo = -1;
 unsigned long long global_hashrate;
 static bool opt_unittest = false;
 unsigned long global_quota_gcd = 1;
+time_t last_getwork;
 
 #ifdef HAVE_OPENCL
 int opt_dynamic_interval = 7;
@@ -174,6 +190,15 @@ int httpsrv_port = -1;
 int stratumsrv_port = -1;
 #endif
 
+const
+int rescan_delay_ms = 1000;
+#ifdef HAVE_BFG_HOTPLUG
+bool opt_hotplug = 1;
+const
+int hotplug_delay_ms = 100;
+#else
+const bool opt_hotplug;
+#endif
 struct string_elist *scan_devices;
 static struct string_elist *opt_set_device_list;
 bool opt_force_dev_init;
@@ -216,16 +241,8 @@ bool opt_api_network;
 bool opt_delaynet;
 bool opt_disable_pool;
 static bool no_work;
-char *opt_icarus_options = NULL;
-char *opt_icarus_timing = NULL;
 bool opt_worktime;
 bool opt_weighed_stats;
-#ifdef USE_AVALON
-char *opt_avalon_options = NULL;
-#endif
-#ifdef USE_KLONDIKE
-char *opt_klondike_options = NULL;
-#endif
 
 char *opt_kernel_path;
 char *cgminer_path;
@@ -279,10 +296,10 @@ static struct work *submit_waiting;
 notifier_t submit_waiting_notifier;
 
 int hw_errors;
-int total_accepted, total_rejected, total_diff1;
-int total_bad_nonces;
+int total_accepted, total_rejected;
 int total_getworks, total_stale, total_discarded;
 uint64_t total_bytes_rcvd, total_bytes_sent;
+double total_diff1, total_bad_diff1;
 double total_diff_accepted, total_diff_rejected, total_diff_stale;
 static int staged_rollable;
 unsigned int new_blocks;
@@ -1111,6 +1128,40 @@ struct pool *current_pool(void)
 	return pool;
 }
 
+// Copied from ccan/opt/helpers.c
+static char *arg_bad(const char *fmt, const char *arg)
+{
+	char *str = malloc(strlen(fmt) + strlen(arg));
+	sprintf(str, fmt, arg);
+	return str;
+}
+
+static
+char *opt_set_floatval(const char *arg, float *f)
+{
+	char *endp;
+
+	errno = 0;
+	*f = strtof(arg, &endp);
+	if (*endp || !arg[0])
+		return arg_bad("'%s' is not a number", arg);
+	if (errno)
+		return arg_bad("'%s' is out of range", arg);
+	return NULL;
+}
+
+static
+void opt_show_floatval(char buf[OPT_SHOW_LEN], const float *f)
+{
+	snprintf(buf, OPT_SHOW_LEN, "%.1f", *f);
+}
+
+static
+char *set_bool_ignore_arg(const char * const arg, bool * const b)
+{
+	return opt_set_bool(b);
+}
+
 char *set_int_range(const char *arg, int *i, int min, int max)
 {
 	char *err = opt_set_intval(arg, i);
@@ -1166,6 +1217,25 @@ static char *set_b58addr(const char *arg, struct _cbscript_t *p)
 	return NULL;
 }
 #endif
+
+static
+char *set_quit_summary(const char * const arg)
+{
+	if (!(strcasecmp(arg, "none") && strcasecmp(arg, "no")))
+		opt_quit_summary = BQS_NONE;
+	else
+	if (!(strcasecmp(arg, "devs") && strcasecmp(arg, "devices")))
+		opt_quit_summary = BQS_DEVS;
+	else
+	if (!(strcasecmp(arg, "procs") && strcasecmp(arg, "processors") && strcasecmp(arg, "chips") && strcasecmp(arg, "cores")))
+		opt_quit_summary = BQS_PROCS;
+	else
+	if (!(strcasecmp(arg, "detailed") && strcasecmp(arg, "detail") && strcasecmp(arg, "all")))
+		opt_quit_summary = BQS_DETAILED;
+	else
+		return "Quit summary must be one of none/devs/procs/detailed";
+	return NULL;
+}
 
 static void bdiff_target_leadzero(unsigned char *target, double diff);
 
@@ -1412,13 +1482,13 @@ static void setup_url(struct pool *pool, char *arg)
 	opt_set_charp(arg, &pool->rpc_url);
 	if (strncmp(arg, "http://", 7) &&
 	    strncmp(arg, "https://", 8)) {
+		const size_t L = strlen(arg);
 		char *httpinput;
 
-		httpinput = malloc(255);
+		httpinput = malloc(8 + L);
 		if (!httpinput)
 			quit(1, "Failed to malloc httpinput");
-		strcpy(httpinput, "http://");
-		strncat(httpinput, arg, 248);
+		sprintf(httpinput, "http://%s", arg);
 		pool->rpc_url = httpinput;
 	}
 }
@@ -1662,107 +1732,39 @@ static char *set_sharelog(char *arg)
 	return _bfgopt_set_file(arg, &sharelog_file, "a", "share log");
 }
 
-static char *temp_cutoff_str = "";
-static char *temp_target_str = "";
+static
+void _add_set_device_option(const char * const func, const char * const buf)
+{
+	applog(LOG_DEBUG, "%s: Using --set-device %s", func, buf);
+	string_elist_add(buf, &opt_set_device_list);
+}
+
+#define add_set_device_option(...)  do{  \
+	char _tmp1718[0x100];  \
+	snprintf(_tmp1718, sizeof(_tmp1718), __VA_ARGS__);  \
+	_add_set_device_option(__func__, _tmp1718);  \
+}while(0)
 
 char *set_temp_cutoff(char *arg)
 {
-	int val;
-
-	if (!(arg && arg[0]))
-		return "Invalid parameters for set temp cutoff";
-	val = atoi(arg);
-	if (val < 0 || val > 200)
-		return "Invalid value passed to set temp cutoff";
-	temp_cutoff_str = arg;
-
+	if (strchr(arg, ','))
+		return "temp-cutoff no longer supports comma-delimited syntax, use --set-device for better control";
+	applog(LOG_WARNING, "temp-cutoff is deprecated! Use --set-device for better control");
+	
+	add_set_device_option("all:temp-cutoff=%s", arg);
+	
 	return NULL;
 }
 
 char *set_temp_target(char *arg)
 {
-	int val;
-
-	if (!(arg && arg[0]))
-		return "Invalid parameters for set temp target";
-	val = atoi(arg);
-	if (val < 0 || val > 200)
-		return "Invalid value passed to set temp target";
-	temp_target_str = arg;
-
+	if (strchr(arg, ','))
+		return "temp-target no longer supports comma-delimited syntax, use --set-device for better control";
+	applog(LOG_WARNING, "temp-target is deprecated! Use --set-device for better control");
+	
+	add_set_device_option("all:temp-target=%s", arg);
+	
 	return NULL;
-}
-
-// For a single element string, this always returns the number (for all calls)
-// For multi-element strings, it returns each element as a number in order, and 0 when there are no more
-static int temp_strtok(char *base, char **n)
-{
-	char *i = *n;
-	char *p = strchr(i, ',');
-	if (p) {
-		p[0] = '\0';
-		*n = &p[1];
-	}
-	else
-	if (base != i)
-		*n = strchr(i, '\0');
-	return atoi(i);
-}
-
-static void load_temp_config_cgpu(struct cgpu_info *cgpu, char **cutoff_np, char **target_np)
-{
-	int target_off, val;
-	
-	// cutoff default may be specified by driver during probe; otherwise, opt_cutofftemp (const)
-	if (!cgpu->cutofftemp)
-		cgpu->cutofftemp = opt_cutofftemp;
-	
-	// target default may be specified by driver, and is moved with offset; otherwise, offset minus 6
-	if (cgpu->targettemp)
-		target_off = cgpu->targettemp - cgpu->cutofftemp;
-	else
-		target_off = -6;
-	
-	cgpu->cutofftemp_default = cgpu->cutofftemp;
-	
-	val = temp_strtok(temp_cutoff_str, cutoff_np);
-	if (val < 0 || val > 200)
-		quit(1, "Invalid value passed to set temp cutoff");
-	if (val)
-		cgpu->cutofftemp = val;
-	
-	cgpu->targettemp_default = cgpu->cutofftemp + target_off;
-	
-	val = temp_strtok(temp_target_str, target_np);
-	if (val < 0 || val > 200)
-		quit(1, "Invalid value passed to set temp target");
-	if (val)
-		cgpu->targettemp = val;
-	else
-		cgpu->targettemp = cgpu->cutofftemp + target_off;
-	
-	applog(LOG_DEBUG, "%"PRIprepr": Set temperature config: target=%d cutoff=%d",
-	       cgpu->proc_repr,
-	       cgpu->targettemp, cgpu->cutofftemp);
-}
-
-static void load_temp_config()
-{
-	int i;
-	char *cutoff_n, *target_n;
-	struct cgpu_info *cgpu;
-
-	cutoff_n = temp_cutoff_str;
-	target_n = temp_target_str;
-
-	for (i = 0; i < total_devices; ++i) {
-		cgpu = get_devices(i);
-		load_temp_config_cgpu(cgpu, &cutoff_n, &target_n);
-	}
-	if (cutoff_n != temp_cutoff_str && cutoff_n[0])
-		quit(1, "Too many values passed to set temp cutoff");
-	if (target_n != temp_target_str && target_n[0])
-		quit(1, "Too many values passed to set temp target");
 }
 
 static char *set_api_allow(const char *arg)
@@ -1794,26 +1796,77 @@ static char *set_api_mcast_des(const char *arg)
 }
 
 #ifdef USE_ICARUS
+extern const struct bfg_set_device_definition icarus_set_device_funcs[];
+
 static char *set_icarus_options(const char *arg)
 {
-	opt_set_charp(arg, &opt_icarus_options);
-
+	if (strchr(arg, ','))
+		return "icarus-options no longer supports comma-delimited syntax, see README.FPGA for better control";
+	applog(LOG_WARNING, "icarus-options is deprecated! See README.FPGA for better control");
+	
+	char *opts = strdup(arg), *argdup;
+	argdup = opts;
+	const struct bfg_set_device_definition *sdf = icarus_set_device_funcs;
+	const char *drivers[] = {"antminer", "cairnsmore", "erupter", "icarus"};
+	char *saveptr, *opt;
+	for (int i = 0; i < 4; ++i, ++sdf)
+	{
+		opt = strtok_r(opts, ":", &saveptr);
+		opts = NULL;
+		
+		if (!opt)
+			break;
+		
+		if (!opt[0])
+			continue;
+		
+		for (int j = 0; j < 4; ++j)
+			add_set_device_option("%s:%s=%s", drivers[j], sdf->optname, opt);
+	}
+	free(argdup);
 	return NULL;
 }
 
 static char *set_icarus_timing(const char *arg)
 {
-	opt_set_charp(arg, &opt_icarus_timing);
-
+	if (strchr(arg, ','))
+		return "icarus-timing no longer supports comma-delimited syntax, see README.FPGA for better control";
+	applog(LOG_WARNING, "icarus-timing is deprecated! See README.FPGA for better control");
+	
+	const char *drivers[] = {"antminer", "cairnsmore", "erupter", "icarus"};
+	for (int j = 0; j < 4; ++j)
+		add_set_device_option("%s:timing=%s", drivers[j], arg);
 	return NULL;
 }
 #endif
 
 #ifdef USE_AVALON
+extern const struct bfg_set_device_definition avalon_set_device_funcs[];
+
 static char *set_avalon_options(const char *arg)
 {
-	opt_set_charp(arg, &opt_avalon_options);
-
+	if (strchr(arg, ','))
+		return "avalon-options no longer supports comma-delimited syntax, see README.FPGA for better control";
+	applog(LOG_WARNING, "avalon-options is deprecated! See README.FPGA for better control");
+	
+	char *opts = strdup(arg), *argdup;
+	argdup = opts;
+	const struct bfg_set_device_definition *sdf = avalon_set_device_funcs;
+	char *saveptr, *opt;
+	for (int i = 0; i < 5; ++i, ++sdf)
+	{
+		opt = strtok_r(opts, ":", &saveptr);
+		opts = NULL;
+		
+		if (!opt)
+			break;
+		
+		if (!opt[0])
+			continue;
+		
+		add_set_device_option("avalon:%s=%s", sdf->optname, opt);
+	}
+	free(argdup);
 	return NULL;
 }
 #endif
@@ -1821,8 +1874,20 @@ static char *set_avalon_options(const char *arg)
 #ifdef USE_KLONDIKE
 static char *set_klondike_options(const char *arg)
 {
-	opt_set_charp(arg, &opt_klondike_options);
-
+	int hashclock;
+	double temptarget;
+	switch (sscanf(arg, "%d:%lf", &hashclock, &temptarget))
+	{
+		default:
+			return "Unrecognised --klondike-options";
+		case 2:
+			add_set_device_option("klondike:temp-target=%lf", temptarget);
+			// fallthru
+		case 1:
+			add_set_device_option("klondike:clock=%d", hashclock);
+	}
+	applog(LOG_WARNING, "klondike-options is deprecated! Use --set-device for better control");
+	
 	return NULL;
 }
 #endif
@@ -1836,7 +1901,7 @@ static char *set_null(const char __maybe_unused *arg)
 /* These options are available from config file or commandline */
 static struct opt_table opt_config_table[] = {
 #ifdef WANT_CPUMINE
-	OPT_WITH_ARG("--algo|-a",
+	OPT_WITH_ARG("--algo",
 		     set_algo, show_algo, &opt_algo,
 		     "Specify sha256 implementation for CPU mining:\n"
 		     "\tfastauto*\tQuick benchmark at startup to pick a working algorithm\n"
@@ -1865,6 +1930,9 @@ static struct opt_table opt_config_table[] = {
     "\n\taltivec_4way\tAltivec implementation for PowerPC G4 and G5 machines"
 #endif
 		),
+	OPT_WITH_ARG("-a",
+	             set_algo, show_algo, &opt_algo,
+	             opt_hidden),
 #endif
 	OPT_WITH_ARG("--api-allow",
 		     set_api_allow, NULL, NULL,
@@ -1902,10 +1970,10 @@ static struct opt_table opt_config_table[] = {
 #ifdef HAVE_ADL
 	OPT_WITHOUT_ARG("--auto-fan",
 			opt_set_bool, &opt_autofan,
-			"Automatically adjust all GPU fan speeds to maintain a target temperature"),
+			opt_hidden),
 	OPT_WITHOUT_ARG("--auto-gpu",
 			opt_set_bool, &opt_autoengine,
-			"Automatically adjust all GPU engine clock speeds to maintain a target temperature"),
+			opt_hidden),
 #endif
 	OPT_WITHOUT_ARG("--balance",
 		     set_balance, &pool_strategy,
@@ -1919,7 +1987,7 @@ static struct opt_table opt_config_table[] = {
 			"Use nonce range on bitforce devices if supported"),
 #endif
 #ifdef WANT_CPUMINE
-	OPT_WITH_ARG("--bench-algo|-b",
+	OPT_WITH_ARG("--bench-algo",
 		     set_int_0_to_9999, opt_show_intval, &opt_bench_algo,
 		     opt_hidden),
 #endif
@@ -1941,7 +2009,7 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--coinbase-addr",
 		     set_b58addr, NULL, &opt_coinbase_script,
 		     "Set coinbase payout address for solo mining"),
-	OPT_WITH_ARG("--coinbase-payout|--cbaddr|--cb-addr|--payout",
+	OPT_WITH_ARG("--coinbase-address|--coinbase-payout|--cbaddress|--cbaddr|--cb-address|--cb-addr|--payout",
 		     set_b58addr, NULL, &opt_coinbase_script,
 		     opt_hidden),
 #endif
@@ -1959,9 +2027,12 @@ static struct opt_table opt_config_table[] = {
 			"Use compact display without per device statistics"),
 #endif
 #ifdef WANT_CPUMINE
-	OPT_WITH_ARG("--cpu-threads|-t",
+	OPT_WITH_ARG("--cpu-threads",
 		     force_nthreads_int, opt_show_intval, &opt_n_threads,
 		     "Number of miner CPU threads"),
+	OPT_WITH_ARG("-t",
+	             force_nthreads_int, opt_show_intval, &opt_n_threads,
+	             opt_hidden),
 #endif
 	OPT_WITHOUT_ARG("--debug|-D",
 		     enable_debug, &opt_debug,
@@ -1983,14 +2054,12 @@ static struct opt_table opt_config_table[] = {
 	             opt_set_intval, opt_show_intval, &httpsrv_port,
 	             "Port number to listen on for HTTP getwork miners (-1 means disabled)"),
 #endif
-#if defined(WANT_CPUMINE) && (defined(HAVE_OPENCL) || defined(USE_FPGA))
-	OPT_WITHOUT_ARG("--enable-cpu|-C",
-			opt_set_bool, &opt_usecpu,
-			opt_hidden),
-#endif
-	OPT_WITH_ARG("--expiry|-E",
+	OPT_WITH_ARG("--expiry",
 		     set_int_0_to_9999, opt_show_intval, &opt_expiry,
 		     "Upper bound on how many seconds after getting work we consider a share from it stale (w/o longpoll active)"),
+	OPT_WITH_ARG("-E",
+	             set_int_0_to_9999, opt_show_intval, &opt_expiry,
+	             opt_hidden),
 	OPT_WITH_ARG("--expiry-lp",
 		     set_int_0_to_9999, opt_show_intval, &opt_expiry_lp,
 		     "Upper bound on how many seconds after getting work we consider a share from it stale (with longpoll active)"),
@@ -2005,65 +2074,60 @@ static struct opt_table opt_config_table[] = {
 #ifdef HAVE_OPENCL
 	OPT_WITH_ARG("--gpu-dyninterval",
 		     set_int_1_to_65535, opt_show_intval, &opt_dynamic_interval,
-		     "Set the refresh interval in ms for GPUs using dynamic intensity"),
+		     opt_hidden),
 	OPT_WITH_ARG("--gpu-platform",
 		     set_int_0_to_9999, opt_show_intval, &opt_platform_id,
 		     "Select OpenCL platform ID to use for GPU mining"),
 	OPT_WITH_ARG("--gpu-threads|-g",
-		     set_int_1_to_10, opt_show_intval, &opt_g_threads,
-		     "Number of threads per GPU (1 - 10)"),
+	             set_gpu_threads, opt_show_intval, &opt_g_threads,
+	             opt_hidden),
 #ifdef HAVE_ADL
 	OPT_WITH_ARG("--gpu-engine",
 		     set_gpu_engine, NULL, NULL,
-		     "GPU engine (over)clock range in MHz - one value, range and/or comma separated list (e.g. 850-900,900,750-850)"),
+	             opt_hidden),
 	OPT_WITH_ARG("--gpu-fan",
 		     set_gpu_fan, NULL, NULL,
-		     "GPU fan percentage range - one value, range and/or comma separated list (e.g. 0-85,85,65)"),
+	             opt_hidden),
 	OPT_WITH_ARG("--gpu-map",
 		     set_gpu_map, NULL, NULL,
 		     "Map OpenCL to ADL device order manually, paired CSV (e.g. 1:0,2:1 maps OpenCL 1 to ADL 0, 2 to 1)"),
 	OPT_WITH_ARG("--gpu-memclock",
 		     set_gpu_memclock, NULL, NULL,
-		     "Set the GPU memory (over)clock in MHz - one value for all or separate by commas for per card"),
+	             opt_hidden),
 	OPT_WITH_ARG("--gpu-memdiff",
 		     set_gpu_memdiff, NULL, NULL,
-		     "Set a fixed difference in clock speed between the GPU and memory in auto-gpu mode"),
+	             opt_hidden),
 	OPT_WITH_ARG("--gpu-powertune",
 		     set_gpu_powertune, NULL, NULL,
-		     "Set the GPU powertune percentage - one value for all or separate by commas for per card"),
+	             opt_hidden),
 	OPT_WITHOUT_ARG("--gpu-reorder",
 			opt_set_bool, &opt_reorder,
 			"Attempt to reorder GPU devices according to PCI Bus ID"),
 	OPT_WITH_ARG("--gpu-vddc",
 		     set_gpu_vddc, NULL, NULL,
-		     "Set the GPU voltage in Volts - one value for all or separate by commas for per card"),
+	             opt_hidden),
 #endif
 #ifdef USE_SCRYPT
 	OPT_WITH_ARG("--lookup-gap",
 		     set_lookup_gap, NULL, NULL,
-		     "Set GPU lookup gap for scrypt mining, comma separated"),
-	OPT_WITH_ARG("--intensity|-I",
-		     set_intensity, NULL, NULL,
-		     "Intensity of GPU scanning (d or " MIN_SHA_INTENSITY_STR
-		     " -> " MAX_SCRYPT_INTENSITY_STR
-		     ",default: d to maintain desktop interactivity)"),
-#else
-	OPT_WITH_ARG("--intensity|-I",
-		     set_intensity, NULL, NULL,
-		     "Intensity of GPU scanning (d or " MIN_SHA_INTENSITY_STR
-		     " -> " MAX_SHA_INTENSITY_STR
-		     ",default: d to maintain desktop interactivity)"),
+	             opt_hidden),
 #endif
+	OPT_WITH_ARG("--intensity|-I",
+	             set_intensity, NULL, NULL,
+	             opt_hidden),
 #endif
 #if defined(HAVE_OPENCL) || defined(USE_MODMINER) || defined(USE_X6500) || defined(USE_ZTEX)
-	OPT_WITH_ARG("--kernel-path|-K",
+	OPT_WITH_ARG("--kernel-path",
 		     opt_set_charp, opt_show_charp, &opt_kernel_path,
 	             "Specify a path to where bitstream and kernel files are"),
+	OPT_WITH_ARG("-K",
+	             opt_set_charp, opt_show_charp, &opt_kernel_path,
+	             opt_hidden),
 #endif
 #ifdef HAVE_OPENCL
 	OPT_WITH_ARG("--kernel|-k",
-		     set_kernel, NULL, NULL,
-		     "Override sha256 kernel to use (diablo, poclbm, phatk or diakgcn) - one value or comma separated"),
+	             set_kernel, NULL, NULL,
+	             opt_hidden),
 #endif
 #ifdef USE_ICARUS
 	OPT_WITH_ARG("--icarus-options",
@@ -2120,6 +2184,15 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--no-getwork",
 			opt_set_invbool, &want_getwork,
 			"Disable getwork support"),
+	OPT_WITHOUT_ARG("--no-hotplug",
+#ifdef HAVE_BFG_HOTPLUG
+	                opt_set_invbool, &opt_hotplug,
+	                "Disable hotplug detection"
+#else
+	                set_null, &opt_hotplug,
+	                opt_hidden
+#endif
+	),
 	OPT_WITHOUT_ARG("--no-longpoll",
 			opt_set_invbool, &want_longpoll,
 			"Disable X-Long-Polling support"),
@@ -2189,6 +2262,9 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--quiet-work-updates|--quiet-work-update",
 			opt_set_bool, &opt_quiet_work_updates,
 			opt_hidden),
+	OPT_WITH_ARG("--quit-summary",
+	             set_quit_summary, NULL, NULL,
+	             "Summary printed when you quit: none/devs/procs/detailed"),
 	OPT_WITH_ARG("--quota|-U",
 		     set_quota, NULL, NULL,
 		     "quota;URL combination for server with load-balance strategy quotas"),
@@ -2216,9 +2292,12 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--scan-device|--scan-serial|--devscan",
 		     add_serial, NULL, NULL,
 		     opt_hidden),
-	OPT_WITH_ARG("--scan-time|-s",
+	OPT_WITH_ARG("--scan-time",
 		     set_int_0_to_9999, opt_show_intval, &opt_scantime,
 		     "Upper bound on time spent scanning current work, in seconds"),
+	OPT_WITH_ARG("-s",
+		     set_int_0_to_9999, opt_show_intval, &opt_scantime,
+		     opt_hidden),
 	OPT_WITH_ARG("--scantime",
 		     set_int_0_to_9999, opt_show_intval, &opt_scantime,
 		     opt_hidden),
@@ -2233,13 +2312,13 @@ static struct opt_table opt_config_table[] = {
 			opt_set_bool, &opt_scrypt,
 			"Use the scrypt algorithm for mining (non-bitcoin)"),
 #endif
-	OPT_WITH_ARG("--set-device",
+	OPT_WITH_ARG("--set-device|--set",
 			opt_string_elist_add, NULL, &opt_set_device_list,
 			"Set default parameters on devices; eg, NFY:osc6_bits=50"),
 #if defined(USE_SCRYPT) && defined(HAVE_OPENCL)
 	OPT_WITH_ARG("--shaders",
 		     set_shaders, NULL, NULL,
-		     "GPU shaders per card for tuning scrypt, comma separated"),
+	             opt_hidden),
 #endif
 #ifdef HAVE_PWD_H
         OPT_WITH_ARG("--setuid",
@@ -2282,18 +2361,18 @@ static struct opt_table opt_config_table[] = {
 #endif
 	OPT_WITH_ARG("--temp-cutoff",
 		     set_temp_cutoff, NULL, &opt_cutofftemp,
-		     "Maximum temperature devices will be allowed to reach before being disabled, one value or comma separated list"),
+		     opt_hidden),
 	OPT_WITH_ARG("--temp-hysteresis",
 		     set_int_1_to_10, opt_show_intval, &opt_hysteresis,
 		     "Set how much the temperature can fluctuate outside limits when automanaging speeds"),
 #ifdef HAVE_ADL
 	OPT_WITH_ARG("--temp-overheat",
 		     set_temp_overheat, opt_show_intval, &opt_overheattemp,
-		     "Overheat temperature when automatically managing fan and GPU speeds, one value or comma separated list"),
+	             opt_hidden),
 #endif
 	OPT_WITH_ARG("--temp-target",
 		     set_temp_target, NULL, NULL,
-		     "Target temperature when automatically managing fan and clock speeds, one value or comma separated list"),
+		     opt_hidden),
 	OPT_WITHOUT_ARG("--text-only|-T",
 			opt_set_invbool, &use_curses,
 #ifdef HAVE_CURSES
@@ -2305,7 +2384,7 @@ static struct opt_table opt_config_table[] = {
 #if defined(USE_SCRYPT) && defined(HAVE_OPENCL)
 	OPT_WITH_ARG("--thread-concurrency",
 		     set_thread_concurrency, NULL, NULL,
-		     "Set GPU thread concurrency for scrypt mining, comma separated"),
+	             opt_hidden),
 #endif
 #ifdef USE_UNICODE
 	OPT_WITHOUT_ARG("--unicode",
@@ -2320,8 +2399,8 @@ static struct opt_table opt_config_table[] = {
 		     "Username for bitcoin JSON-RPC server"),
 #ifdef HAVE_OPENCL
 	OPT_WITH_ARG("--vectors|-v",
-		     set_vector, NULL, NULL,
-		     "Override detected optimal vector (1, 2 or 4) - one value or comma separated list"),
+	             set_vector, NULL, NULL,
+	             opt_hidden),
 #endif
 	OPT_WITHOUT_ARG("--verbose",
 			opt_set_bool, &opt_log_output,
@@ -2331,8 +2410,8 @@ static struct opt_table opt_config_table[] = {
 	                "Display statistics weighed to difficulty 1"),
 #ifdef HAVE_OPENCL
 	OPT_WITH_ARG("--worksize|-w",
-		     set_worksize, NULL, NULL,
-		     "Override detected optimal worksize - one value or comma separated list"),
+	             set_worksize, NULL, NULL,
+	             opt_hidden),
 #endif
 	OPT_WITHOUT_ARG("--unittest",
 			opt_set_bool, &opt_unittest, opt_hidden),
@@ -2513,13 +2592,25 @@ extern const char *opt_argv0;
 static char *opt_verusage_and_exit(const char *extra)
 {
 	puts(packagename);
+	printf("  Lowlevel:%s\n", BFG_LOWLLIST);
 	printf("  Drivers:%s\n", BFG_DRIVERLIST);
-	printf("  Algoritms:%s\n", BFG_ALGOLIST);
+	printf("  Algorithms:%s\n", BFG_ALGOLIST);
 	printf("  Options:%s\n", BFG_OPTLIST);
 	printf("%s", opt_usage(opt_argv0, extra));
 	fflush(stdout);
 	exit(0);
 }
+
+/* These options are parsed before anything else */
+static struct opt_table opt_early_table[] = {
+	OPT_EARLY_WITH_ARG("--config|-c",
+	                   set_bool_ignore_arg, NULL, &config_loaded,
+	                   opt_hidden),
+	OPT_EARLY_WITHOUT_ARG("--no-config",
+	                opt_set_bool, &config_loaded,
+	                "Inhibit loading default config file"),
+	OPT_ENDTABLE
+};
 
 /* These options are available from commandline only */
 static struct opt_table opt_cmdline_table[] = {
@@ -2527,6 +2618,9 @@ static struct opt_table opt_cmdline_table[] = {
 		     load_config, NULL, NULL,
 		     "Load a JSON-format configuration file\n"
 		     "See example.conf for an example configuration."),
+	OPT_EARLY_WITHOUT_ARG("--no-config",
+	                opt_set_bool, &config_loaded,
+	                "Inhibit loading default config file"),
 	OPT_WITHOUT_ARG("--help|-h",
 			opt_verusage_and_exit, NULL,
 			"Print this message"),
@@ -2600,6 +2694,8 @@ void clean_work(struct work *work)
 	free(work->job_id);
 	bytes_free(&work->nonce2);
 	free(work->nonce1);
+	if (work->device_data_free_func)
+		work->device_data_free_func(work);
 
 	if (work->tmpl) {
 		struct pool *pool = work->pool;
@@ -3003,62 +3099,10 @@ double cgpu_utility(struct cgpu_info *cgpu)
 	return cgpu->utility = cgpu->accepted / dev_runtime * 60;
 }
 
-/* Convert a uint64_t value into a truncated string for displaying with its
- * associated suitable for Mega, Giga etc. Buf array needs to be long enough */
-static void suffix_string(uint64_t val, char *buf, size_t bufsiz, int sigdigits)
-{
-	const double  dkilo = 1000.0;
-	const uint64_t kilo = 1000ull;
-	const uint64_t mega = 1000000ull;
-	const uint64_t giga = 1000000000ull;
-	const uint64_t tera = 1000000000000ull;
-	const uint64_t peta = 1000000000000000ull;
-	const uint64_t exa  = 1000000000000000000ull;
-	char suffix[2] = "";
-	bool decimal = true;
-	double dval;
-
-	if (val >= exa) {
-		val /= peta;
-		dval = (double)val / dkilo;
-		strcpy(suffix, "E");
-	} else if (val >= peta) {
-		val /= tera;
-		dval = (double)val / dkilo;
-		strcpy(suffix, "P");
-	} else if (val >= tera) {
-		val /= giga;
-		dval = (double)val / dkilo;
-		strcpy(suffix, "T");
-	} else if (val >= giga) {
-		val /= mega;
-		dval = (double)val / dkilo;
-		strcpy(suffix, "G");
-	} else if (val >= mega) {
-		val /= kilo;
-		dval = (double)val / dkilo;
-		strcpy(suffix, "M");
-	} else if (val >= kilo) {
-		dval = (double)val / dkilo;
-		strcpy(suffix, "k");
-	} else {
-		dval = val;
-		decimal = false;
-	}
-
-	if (!sigdigits) {
-		if (decimal)
-			snprintf(buf, bufsiz, "%.3g%s", dval, suffix);
-		else
-			snprintf(buf, bufsiz, "%d%s", (unsigned int)dval, suffix);
-	} else {
-		/* Always show sigdigits + 1, padded on right with zeroes
-		 * followed by suffix */
-		int ndigits = sigdigits - 1 - (dval > 0.0 ? floor(log10(dval)) : 0);
-
-		snprintf(buf, bufsiz, "%*.*f%s", sigdigits + 1, ndigits, dval, suffix);
-	}
-}
+#define suffix_string(val, buf, bufsiz, sigdigits)  do{ \
+	_Static_assert(sigdigits == 0, "suffix_string only supported with sigdigits==0");  \
+	format_unit3(buf, bufsiz, FUP_DIFF, "", H2B_SHORTV, val, -1);  \
+}while(0)
 
 static float
 utility_to_hashrate(double utility)
@@ -3099,6 +3143,7 @@ enum h2bs_fmt {
 	H2B_NOUNIT,  // "xxx.x"
 	H2B_SHORT,   // "xxx.xMH/s"
 	H2B_SPACED,  // "xxx.x MH/s"
+	H2B_SHORTV,  // Like H2B_SHORT, but omit space for base unit
 };
 static const size_t h2bs_fmt_size[] = {6, 10, 11};
 
@@ -3106,6 +3151,7 @@ enum bfu_floatprec {
 	FUP_INTEGER,
 	FUP_HASHES,
 	FUP_BTC,
+	FUP_DIFF,
 };
 
 static
@@ -3147,6 +3193,12 @@ int format_unit3(char *buf, size_t sz, enum bfu_floatprec fprec, const char *mea
 		else
 			prec = 2;
 		_SNP("%5.*f", prec, hashrate);
+		break;
+	case FUP_DIFF:
+		if (unit > _unitbase)
+			_SNP("%.3g", hashrate);
+		else
+			_SNP("%u", (unsigned int)hashrate);
 	}
 	
 	switch (fmt) {
@@ -3156,6 +3208,8 @@ int format_unit3(char *buf, size_t sz, enum bfu_floatprec fprec, const char *mea
 		_SNP("%c%s", _unitchar[unit], measurement);
 	default:
 		break;
+	case H2B_SHORTV:
+		_SNP("%.1s%s", (unit == _unitbase) ? "" : &_unitchar[unit], measurement);
 	}
 	
 	return rv;
@@ -3308,7 +3362,7 @@ static void adj_width(int var, int *length);
 static int awidth = 1, rwidth = 1, swidth = 1, hwwidth = 1;
 
 static
-void format_statline(char *buf, size_t bufsz, const char *cHr, const char *aHr, const char *uHr, int accepted, int rejected, int stale, int wnotaccepted, int waccepted, int hwerrs, int badnonces, int allnonces)
+void format_statline(char *buf, size_t bufsz, const char *cHr, const char *aHr, const char *uHr, int accepted, int rejected, int stale, int wnotaccepted, int waccepted, int hwerrs, int bad_diff1, int allnonces)
 {
 	char rejpcbuf[6];
 	char bnbuf[6];
@@ -3318,7 +3372,7 @@ void format_statline(char *buf, size_t bufsz, const char *cHr, const char *aHr, 
 	adj_width(stale, &swidth);
 	adj_width(hwerrs, &hwwidth);
 	percentf4(rejpcbuf, sizeof(rejpcbuf), wnotaccepted, waccepted);
-	percentf3(bnbuf, sizeof(bnbuf), badnonces, allnonces);
+	percentf3(bnbuf, sizeof(bnbuf), bad_diff1, allnonces);
 	
 	tailsprintf(buf, bufsz, "%s/%s/%s | A:%*d R:%*d+%*d(%s) HW:%*d/%s",
 	            cHr, aHr, uHr,
@@ -3373,10 +3427,11 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 	int accepted, rejected, stale;
 	double waccepted;
 	double wnotaccepted;
-	int hwerrs, badnonces, goodnonces;
+	int hwerrs;
+	double bad_diff1, good_diff1;
 	
 	rolling = mhashes = waccepted = wnotaccepted = 0;
-	accepted = rejected = stale = hwerrs = badnonces = goodnonces = 0;
+	accepted = rejected = stale = hwerrs = bad_diff1 = good_diff1 = 0;
 	
 	{
 		struct cgpu_info *slave = cgpu;
@@ -3402,8 +3457,8 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 			waccepted += slave->diff_accepted;
 			wnotaccepted += slave->diff_rejected + slave->diff_stale;
 			hwerrs += slave->hw_errors;
-			badnonces += slave->bad_nonces;
-			goodnonces += slave->diff1;
+			bad_diff1 += slave->bad_diff1;
+			good_diff1 += slave->diff1;
 			
 			if (opt_show_procs)
 				break;
@@ -3419,7 +3474,7 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 		3,
 		1e6*rolling,
 		1e6*mhashes / dev_runtime,
-		utility_to_hashrate(goodnonces * (wtotal ? (waccepted / wtotal) : 1) * 60 / dev_runtime));
+		utility_to_hashrate(good_diff1 * (wtotal ? (waccepted / wtotal) : 1) * 60 / dev_runtime));
 
 	// Processor representation
 #ifdef HAVE_CURSES
@@ -3433,6 +3488,9 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 	else
 #endif
 		snprintf(buf, bufsz, "%s ", opt_show_procs ? cgpu->proc_repr_ns : cgpu->dev_repr_ns);
+	
+	if (include_serial_in_statline && cgpu->dev_serial)
+		tailsprintf(buf, bufsz, "[serial=%s] ", cgpu->dev_serial);
 	
 	if (unlikely(cgpu->status == LIFE_INIT))
 	{
@@ -3517,13 +3575,13 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 		                accepted, rejected, stale,
 		                wnotaccepted, waccepted,
 		                hwerrs,
-		                badnonces, badnonces + goodnonces);
+		                bad_diff1, bad_diff1 + good_diff1);
 	}
 	else
 #endif
 	{
 		percentf4(rejpcbuf, sizeof(rejpcbuf), wnotaccepted, waccepted);
-		percentf4(bnbuf, sizeof(bnbuf), badnonces, goodnonces);
+		percentf4(bnbuf, sizeof(bnbuf), bad_diff1, good_diff1);
 		tailsprintf(buf, bufsz, "%ds:%s avg:%s u:%s | A:%d R:%d+%d(%s) HW:%d/%s",
 			opt_log_interval,
 			cHr, aHr, uHr,
@@ -3640,12 +3698,14 @@ void bfg_waddstr(WINDOW *win, const char *s)
 static inline
 void bfg_hline(WINDOW *win, int y)
 {
+	int maxx, __maybe_unused maxy;
+	getmaxyx(win, maxy, maxx);
 #ifdef USE_UNICODE
 	if (use_unicode)
-		mvwhline_set(win, y, 0, WACS_HLINE, 80);
+		mvwhline_set(win, y, 0, WACS_HLINE, maxx);
 	else
 #endif
-		mvwhline(win, y, 0, '-', 80);
+		mvwhline(win, y, 0, '-', maxx);
 }
 
 // Spaces until end of line, using current attributes (ie, not completely clear)
@@ -3657,6 +3717,11 @@ void bfg_wspctoeol(WINDOW * const win, const int offset)
 	getmaxyx(win, y, maxx);
 	getyx(win, y, x);
 	const int space_count = (maxx - x) - offset;
+	
+	// Check for negative - terminal too narrow
+	if (space_count <= 0)
+		return;
+	
 	char buf[space_count];
 	memset(buf, ' ', space_count);
 	waddnstr(win, buf, space_count);
@@ -4566,18 +4631,21 @@ static void calc_diff(struct work *work, int known)
 
 static void get_benchmark_work(struct work *work)
 {
-	// Use a random work block pulled from a pool
-	static uint8_t bench_block[] = { CGMINER_BENCHMARK_BLOCK };
-
-	size_t bench_size = sizeof(*work);
-	size_t work_size = sizeof(bench_block);
-	size_t min_size = (work_size < bench_size ? work_size : bench_size);
-	memset(work, 0, sizeof(*work));
-	memcpy(work, &bench_block, min_size);
+	static uint32_t blkhdr[20];
+	for (int i = 19; i >= 0; --i)
+		if (++blkhdr[i])
+			break;
+	
+	memcpy(&work->data[ 0], blkhdr, 80);
+	memcpy(&work->data[80], workpadding_bin, 48);
+	calc_midstate(work);
+	set_target(work->target, 1.0);
+	
 	work->mandatory = true;
 	work->pool = pools[0];
 	cgtime(&work->tv_getwork);
 	copy_time(&work->tv_getwork_reply, &work->tv_getwork);
+	copy_time(&work->tv_staged, &work->tv_getwork);
 	work->getwork_mode = GETWORK_MODE_BENCHMARK;
 	calc_diff(work, 0);
 }
@@ -5139,6 +5207,9 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 		ntime += noffset;
 		*work_ntime = htobe32(ntime);
 	}
+	
+	if (work->device_data_dup_func)
+		work->device_data = work->device_data_dup_func(work);
 }
 
 /* Generates a copy of an existing work struct, creating fresh heap allocations
@@ -6443,57 +6514,6 @@ char *json_escape(const char *str)
 	return buf;
 }
 
-void _write_config_temps(FILE *fcfg, const char *configname, size_t settingoffset, size_t defoffset)
-{
-	int i, commas;
-	int *setp, allset;
-	uint8_t *defp;
-	
-	for (i = 0; ; ++i)
-	{
-		if (i == total_devices)
-			// All defaults
-			return;
-		setp = ((void*)devices[i]) + settingoffset;
-		defp = ((void*)devices[i]) + defoffset;
-		allset = *setp;
-		if (*setp != *defp)
-			break;
-	}
-	
-	fprintf(fcfg, ",\n\"%s\" : \"", configname);
-	
-	for (i = 1; ; ++i)
-	{
-		if (i == total_devices)
-		{
-			// All the same
-			fprintf(fcfg, "%d\"", allset);
-			return;
-		}
-		setp = ((void*)devices[i]) + settingoffset;
-		if (allset != *setp)
-			break;
-	}
-	
-	commas = 0;
-	for (i = 0; i < total_devices; ++i)
-	{
-		setp = ((void*)devices[i]) + settingoffset;
-		defp = ((void*)devices[i]) + defoffset;
-		if (*setp != *defp)
-		{
-			for ( ; commas; --commas)
-				fputs(",", fcfg);
-			fprintf(fcfg, "%d", *setp);
-		}
-		++commas;
-	}
-	fputs("\"", fcfg);
-}
-#define write_config_temps(fcfg, configname, settingname)  \
-	_write_config_temps(fcfg, configname, offsetof(struct cgpu_info, settingname), offsetof(struct cgpu_info, settingname ## _default))
-
 static
 void _write_config_string_elist(FILE *fcfg, const char *configname, struct string_elist * const elist)
 {
@@ -6540,95 +6560,8 @@ void write_config(FILE *fcfg)
 	}
 	fputs("\n]\n", fcfg);
 
-	write_config_temps(fcfg, "temp-cutoff", cutofftemp);
-	write_config_temps(fcfg, "temp-target", targettemp);
 #ifdef HAVE_OPENCL
-	if (nDevs) {
-		/* Write GPU device values */
-		fputs(",\n\"intensity\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-		{
-			if (i > 0)
-				fputc(',', fcfg);
-			if (gpus[i].dynamic)
-				fputc('d', fcfg);
-			else
-				fprintf(fcfg, "%d", gpus[i].intensity);
-		}
-		fputs("\",\n\"vectors\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "",
-				gpus[i].vwidth);
-		fputs("\",\n\"worksize\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "",
-				(int)gpus[i].work_size);
-		fputs("\",\n\"kernel\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++) {
-			fprintf(fcfg, "%s", i > 0 ? "," : "");
-			switch (gpus[i].kernel) {
-				case KL_NONE: // Shouldn't happen
-					break;
-				case KL_POCLBM:
-					fprintf(fcfg, "poclbm");
-					break;
-				case KL_PHATK:
-					fprintf(fcfg, "phatk");
-					break;
-				case KL_DIAKGCN:
-					fprintf(fcfg, "diakgcn");
-					break;
-				case KL_DIABLO:
-					fprintf(fcfg, "diablo");
-					break;
-				case KL_SCRYPT:
-					fprintf(fcfg, "scrypt");
-					break;
-			}
-		}
-#ifdef USE_SCRYPT
-		fputs("\",\n\"lookup-gap\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "",
-				(int)gpus[i].opt_lg);
-		fputs("\",\n\"thread-concurrency\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "",
-				(int)gpus[i].opt_tc);
-		fputs("\",\n\"shaders\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "",
-				(int)gpus[i].shaders);
-#endif
-#ifdef HAVE_ADL
-		fputs("\",\n\"gpu-engine\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d-%d", i > 0 ? "," : "", gpus[i].min_engine, gpus[i].gpu_engine);
-		fputs("\",\n\"gpu-fan\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d-%d", i > 0 ? "," : "", gpus[i].min_fan, gpus[i].gpu_fan);
-		fputs("\",\n\"gpu-memclock\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "", gpus[i].gpu_memclock);
-		fputs("\",\n\"gpu-memdiff\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "", gpus[i].gpu_memdiff);
-		fputs("\",\n\"gpu-powertune\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "", gpus[i].gpu_powertune);
-		fputs("\",\n\"gpu-vddc\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%1.3f", i > 0 ? "," : "", gpus[i].gpu_vddc);
-		fputs("\",\n\"temp-overheat\" : \"", fcfg);
-		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "", gpus[i].adl.overtemp);
-#endif
-		fputs("\"", fcfg);
-	}
-#endif
-#ifdef HAVE_ADL
-	if (opt_reorder)
-		fprintf(fcfg, ",\n\"gpu-reorder\" : true");
+	write_config_opencl(fcfg);
 #endif
 #ifdef WANT_CPUMINE
 	fprintf(fcfg, ",\n\"algo\" : \"%s\"", algo_names[opt_algo]);
@@ -6716,14 +6649,6 @@ void write_config(FILE *fcfg)
 		fprintf(fcfg, ",\n\"api-description\" : \"%s\"", json_escape(opt_api_description));
 	if (opt_api_groups)
 		fprintf(fcfg, ",\n\"api-groups\" : \"%s\"", json_escape(opt_api_groups));
-	if (opt_icarus_options)
-		fprintf(fcfg, ",\n\"icarus-options\" : \"%s\"", json_escape(opt_icarus_options));
-	if (opt_icarus_timing)
-		fprintf(fcfg, ",\n\"icarus-timing\" : \"%s\"", json_escape(opt_icarus_timing));
-#ifdef USE_KLONDIKE
-	if (opt_klondike_options)
-		fprintf(fcfg, ",\n\"klondike-options\" : \"%s\"", json_escape(opt_klondike_options));
-#endif
 	fputs("\n}\n", fcfg);
 
 	json_escape_free();
@@ -6766,7 +6691,7 @@ void zero_stats(void)
 	total_ro = 0;
 	total_secs = 1.0;
 	total_diff1 = 0;
-	total_bad_nonces = 0;
+	total_bad_diff1 = 0;
 	found_blocks = 0;
 	total_diff_accepted = 0;
 	total_diff_rejected = 0;
@@ -6829,7 +6754,7 @@ void zero_stats(void)
 		cgpu->utility = 0.0;
 		cgpu->utility_diff1 = 0;
 		cgpu->last_share_pool_time = 0;
-		cgpu->bad_nonces = 0;
+		cgpu->bad_diff1 = 0;
 		cgpu->diff1 = 0;
 		cgpu->diff_accepted = 0;
 		cgpu->diff_rejected = 0;
@@ -7853,7 +7778,7 @@ static void hashmeter(int thr_id, struct timeval *diff,
 		                ui_stale,
 		                total_diff_rejected + total_diff_stale, total_diff_accepted,
 		                hw_errors,
-		                total_bad_nonces, total_bad_nonces + total_diff1);
+		                total_bad_diff1, total_bad_diff1 + total_diff1);
 		unlock_curses();
 	}
 #endif
@@ -7863,7 +7788,7 @@ static void hashmeter(int thr_id, struct timeval *diff,
 	uHr[5] = ' ';
 	
 	percentf4(rejpcbuf, sizeof(rejpcbuf), total_diff_rejected + total_diff_stale, total_diff_accepted);
-	percentf4(bnbuf, sizeof(bnbuf), total_bad_nonces, total_diff1);
+	percentf4(bnbuf, sizeof(bnbuf), total_bad_diff1, total_diff1);
 	
 	snprintf(logstatusline, sizeof(logstatusline),
 	         "%s%ds:%s avg:%s u:%s | A:%d R:%d+%d(%s) HW:%d/%s",
@@ -8958,6 +8883,7 @@ struct work *get_work(struct thr_info *thr)
 			wake_gws();
 		}
 	}
+	last_getwork = time(NULL);
 	applog(LOG_DEBUG, "%"PRIpreprv": Got work %d from get queue to get work for thread %d",
 	       cgpu->proc_repr, work->id, thr_id);
 
@@ -8992,6 +8918,20 @@ struct work *get_work(struct thr_info *thr)
 	if (timercmp(&tv_get, &pool_stats->getwork_wait_min, <))
 		pool_stats->getwork_wait_min = tv_get;
 	++pool_stats->getwork_calls;
+	
+	if (work->work_difficulty < 1)
+	{
+		if (unlikely(work->work_difficulty < cgpu->min_nonce_diff))
+		{
+			applog(LOG_WARNING, "%"PRIpreprv": Using work with lower difficulty than device supports",
+			       cgpu->proc_repr);
+			work->nonce_diff = cgpu->min_nonce_diff;
+		}
+		else
+			work->nonce_diff = work->work_difficulty;
+	}
+	else
+		work->nonce_diff = 1;
 
 	return work;
 }
@@ -9000,6 +8940,12 @@ static
 void _submit_work_async(struct work *work)
 {
 	applog(LOG_DEBUG, "Pushing submit work to work thread");
+	
+	if (opt_benchmark)
+	{
+		free_work(work);
+		return;
+	}
 
 	mutex_lock(&submitting_lock);
 	++total_submitting;
@@ -9018,7 +8964,7 @@ static void submit_work_async2(struct work *work, struct timeval *tv_work_found)
 	_submit_work_async(work);
 }
 
-void inc_hw_errors2(struct thr_info *thr, const struct work *work, const uint32_t *bad_nonce_p)
+void inc_hw_errors3(struct thr_info *thr, const struct work *work, const uint32_t *bad_nonce_p, float nonce_diff)
 {
 	struct cgpu_info * const cgpu = thr->cgpu;
 	
@@ -9037,18 +8983,13 @@ void inc_hw_errors2(struct thr_info *thr, const struct work *work, const uint32_
 	++cgpu->hw_errors;
 	if (bad_nonce_p)
 	{
-		++total_bad_nonces;
-		++cgpu->bad_nonces;
+		total_bad_diff1 += nonce_diff;
+		cgpu->bad_diff1 += nonce_diff;
 	}
 	mutex_unlock(&stats_lock);
 
 	if (thr->cgpu->drv->hw_error)
 		thr->cgpu->drv->hw_error(thr);
-}
-
-void inc_hw_errors(struct thr_info *thr, const struct work *work, const uint32_t bad_nonce)
-{
-	inc_hw_errors2(thr, work, work ? &bad_nonce : NULL);
 }
 
 enum test_nonce2_result hashtest2(struct work *work, bool checktarget)
@@ -9160,9 +9101,9 @@ bool submit_noffset_nonce(struct thr_info *thr, struct work *work_in, uint32_t n
 		}
 	
 	mutex_lock(&stats_lock);
-	total_diff1++;
-	thr->cgpu->diff1++;
-	work->pool->diff1++;
+	total_diff1       += work->nonce_diff;
+	thr ->cgpu->diff1 += work->nonce_diff;
+	work->pool->diff1 += work->nonce_diff;
 	thr->cgpu->last_device_valid_work = time(NULL);
 	mutex_unlock(&stats_lock);
 	
@@ -9191,7 +9132,7 @@ out:
 bool abandon_work(struct work *work, struct timeval *wdiff, uint64_t hashes)
 {
 	if (wdiff->tv_sec > opt_scantime ||
-	    work->blk.nonce >= MAXTHREADS - hashes ||
+	    work->blk.nonce >= 0xfffffffe - hashes ||
 	    hashes >= 0xfffffffe ||
 	    stale_work(work, false))
 		return true;
@@ -9218,11 +9159,6 @@ void mt_disable_start(struct thr_info *mythr)
 		drv->thread_disable(mythr);
 	
 	hashmeter2(mythr);
-	if (mythr->prev_work)
-		free_work(mythr->prev_work);
-	mythr->prev_work = mythr->work;
-	mythr->work = NULL;
-	mythr->_job_transition_in_progress = false;
 	__thr_being_msg(LOG_WARNING, mythr, "being disabled");
 	mythr->rolling = mythr->cgpu->rolling = 0;
 	thread_reportout(mythr);
@@ -9874,7 +9810,6 @@ void proc_enable(struct cgpu_info *cgpu)
 
 void cgpu_set_defaults(struct cgpu_info * const cgpu)
 {
-	const struct device_drv * const drv = cgpu->drv;
 	struct string_elist *setstr_elist;
 	const char *p, *p2;
 	char replybuf[0x2000];
@@ -9897,13 +9832,6 @@ void cgpu_set_defaults(struct cgpu_info * const cgpu)
 		
 		applog(LOG_DEBUG, "%"PRIpreprv": %s: Matched with set default: %s",
 		       cgpu->proc_repr, __func__, setstr);
-		
-		if (!drv->set_device)
-		{
-			applog(LOG_WARNING, "%"PRIpreprv": set_device is not implemented (trying to apply rule: %s)",
-			       cgpu->proc_repr, setstr);
-			continue;
-		}
 		
 		if (p[0] == ':')
 			++p;
@@ -9929,18 +9857,31 @@ void cgpu_set_defaults(struct cgpu_info * const cgpu)
 			memcpy(setval, p2, L);
 		setval[L] = '\0';
 		
-		p = drv->set_device(cgpu, opt, setval, replybuf);
-		if (p)
-			applog(LOG_WARNING, "%"PRIpreprv": Applying rule %s: %s",
-			       cgpu->proc_repr, setstr, p);
-		else
-			applog(LOG_DEBUG, "%"PRIpreprv": Applied rule %s",
-			       cgpu->proc_repr, setstr);
+		enum bfg_set_device_replytype success;
+		p = proc_set_device(cgpu, opt, setval, replybuf, &success);
+		switch (success)
+		{
+			case SDR_OK:
+				applog(LOG_DEBUG, "%"PRIpreprv": Applied rule %s%s%s",
+				       cgpu->proc_repr, setstr,
+				       p ? ": " : "", p ?: "");
+				break;
+			case SDR_ERR:
+			case SDR_HELP:
+			case SDR_UNKNOWN:
+				applog(LOG_DEBUG, "%"PRIpreprv": Applying rule %s: %s",
+				       cgpu->proc_repr, setstr, p);
+				break;
+			case SDR_AUTO:
+			case SDR_NOSUPP:
+				applog(LOG_WARNING, "%"PRIpreprv": set_device is not implemented (trying to apply rule: %s)",
+				       cgpu->proc_repr, setstr);
+		}
 	}
 	cgpu->already_set_defaults = true;
 }
 
-void drv_set_defaults(const struct device_drv * const drv, char *(*set_func)(struct cgpu_info *, char *, char *, char *), void *userp)
+void drv_set_defaults(const struct device_drv * const drv, const void *datap, void *userp, const char * const devpath, const char * const serial, const int mode)
 {
 	struct device_drv dummy_drv = *drv;
 	struct cgpu_info dummy_cgpu = {
@@ -9949,9 +9890,20 @@ void drv_set_defaults(const struct device_drv * const drv, char *(*set_func)(str
 		.device_id = -1,
 		.proc_id = -1,
 		.device_data = userp,
+		.device_path = devpath,
+		.dev_serial = serial,
 	};
 	strcpy(dummy_cgpu.proc_repr, drv->name);
-	dummy_drv.set_device = set_func;
+	switch (mode)
+	{
+		case 0:
+			dummy_drv.set_device = datap;
+			break;
+		case 1:
+			dummy_drv.set_device = NULL;
+			dummy_cgpu.set_device_funcs = datap;
+			break;
+	}
 	cgpu_set_defaults(&dummy_cgpu);
 }
 
@@ -10058,7 +10010,6 @@ void bfg_watchdog(struct cgpu_info * const cgpu, struct timeval * const tvp_now)
 			struct thr_info *thr = cgpu->thr[0];
 			enum dev_enable *denable;
 			char *dev_str = cgpu->proc_repr;
-			int gpu;
 
 			if (likely(drv_ready(cgpu)))
 			{
@@ -10068,21 +10019,10 @@ void bfg_watchdog(struct cgpu_info * const cgpu, struct timeval * const tvp_now)
 					cgpu->drv->get_stats(cgpu);
 			}
 
-			gpu = cgpu->device_id;
 			denable = &cgpu->deven;
 
-#ifdef HAVE_ADL
-			if (adl_active && cgpu->has_adl)
-				gpu_autotune(gpu, denable);
-			if (opt_debug && cgpu->has_adl) {
-				int engineclock = 0, memclock = 0, activity = 0, fanspeed = 0, fanpercent = 0, powertune = 0;
-				float temp = 0, vddc = 0;
-
-				if (gpu_stats(gpu, &temp, &engineclock, &memclock, &vddc, &activity, &fanspeed, &fanpercent, &powertune))
-					applog(LOG_DEBUG, "%.1f C  F: %d%%(%dRPM)  E: %dMHz  M: %dMHz  V: %.3fV  A: %d%%  P: %d%%",
-					temp, fanpercent, fanspeed, engineclock, memclock, vddc, activity, powertune);
-			}
-#endif
+			if (cgpu->drv->watchdog)
+				cgpu->drv->watchdog(cgpu, tvp_now);
 			
 			/* Thread is disabled */
 			if (*denable == DEV_DISABLED)
@@ -10111,8 +10051,8 @@ void bfg_watchdog(struct cgpu_info * const cgpu, struct timeval * const tvp_now)
 			else
 			if (cgpu->temp > cgpu->cutofftemp)
 			{
-				applog(LOG_WARNING, "%s hit thermal cutoff limit, disabling!",
-				       dev_str);
+				applog(LOG_WARNING, "%s hit thermal cutoff limit at %dC, disabling!",
+				       dev_str, (int)cgpu->temp);
 				*denable = DEV_RECOVER;
 
 				dev_error(cgpu, REASON_DEV_THERMAL_CUTOFF);
@@ -10155,12 +10095,6 @@ void bfg_watchdog(struct cgpu_info * const cgpu, struct timeval * const tvp_now)
 				dev_error(cgpu, REASON_DEV_SICK_IDLE_60);
 				run_cmd(cmd_sick);
 				
-#ifdef HAVE_ADL
-				if (adl_active && cgpu->has_adl && gpu_activity(gpu) > 50) {
-					applog(LOG_ERR, "GPU still showing activity suggesting a hard hang.");
-					applog(LOG_ERR, "Will not attempt to auto-restart it.");
-				} else
-#endif
 				if (opt_restart && cgpu->drv->reinit_device) {
 					applog(LOG_ERR, "%s: Attempting to restart", dev_str);
 					reinit_device(cgpu);
@@ -10176,11 +10110,6 @@ void bfg_watchdog(struct cgpu_info * const cgpu, struct timeval * const tvp_now)
 				   (cgpu->status == LIFE_SICK || cgpu->status == LIFE_DEAD)) {
 				/* Attempt to restart a GPU that's sick or dead once every minute */
 				cgtime(&thr->sick);
-#ifdef HAVE_ADL
-				if (adl_active && cgpu->has_adl && gpu_activity(gpu) > 50) {
-					/* Again do not attempt to restart a device that may have hard hung */
-				} else
-#endif
 				if (opt_restart)
 					reinit_device(cgpu);
 			}
@@ -10279,18 +10208,24 @@ void print_summary(void)
 		}
 	}
 
-	applog(LOG_WARNING, "Summary of per device statistics:\n");
-	for (i = 0; i < total_devices; ++i) {
-		struct cgpu_info *cgpu = get_devices(i);
-
-		if ((!cgpu->proc_id) && cgpu->procs > 1)
-		{
-			// Device summary line
-			opt_show_procs = false;
-			log_print_status(cgpu);
-			opt_show_procs = true;
+	if (opt_quit_summary != BQS_NONE)
+	{
+		if (opt_quit_summary == BQS_DETAILED)
+			include_serial_in_statline = true;
+		applog(LOG_WARNING, "Summary of per device statistics:\n");
+		for (i = 0; i < total_devices; ++i) {
+			struct cgpu_info *cgpu = get_devices(i);
+			
+			if (!cgpu->proc_id)
+			{
+				// Device summary line
+				opt_show_procs = false;
+				log_print_status(cgpu);
+				opt_show_procs = true;
+			}
+			if ((opt_quit_summary == BQS_PROCS || opt_quit_summary == BQS_DETAILED) && cgpu->procs > 1)
+				log_print_status(cgpu);
 		}
-		log_print_status(cgpu);
 	}
 
 	if (opt_shares) {
@@ -10607,8 +10542,6 @@ void enable_curses(void) {
 		menu_attr = COLOR_PAIR(1);
 		if (ERR != init_pair(2, COLOR_RED, default_bgcolor))
 			attr_bad |= COLOR_PAIR(2);
-		if (ERR != init_pair(3, COLOR_GREEN, COLOR_RED))
-			attr_title |= COLOR_PAIR(3);
 	}
 	keypad(mainwin, true);
 	getmaxyx(mainwin, y, x);
@@ -10694,24 +10627,29 @@ extern struct sigaction pcwm_orig_term_handler;
 
 bool bfg_need_detect_rescan;
 extern void probe_device(struct lowlevel_device_info *);
+static void schedule_rescan(const struct timeval *);
 
 static
 void drv_detect_all()
 {
+	const int algomatch = opt_scrypt ? POW_SCRYPT : POW_SHA256D;
+	bool rescanning = false;
 rescan:
 	bfg_need_detect_rescan = false;
 	
 #ifdef HAVE_BFG_LOWLEVEL
-	struct lowlevel_device_info * const infolist = lowlevel_scan(), *info, *infotmp;
-	
-	LL_FOREACH_SAFE(infolist, info, infotmp)
-		probe_device(info);
-	LL_FOREACH_SAFE(infolist, info, infotmp)
-		pthread_join(info->probe_pth, NULL);
+	if (!opt_scrypt)
+	{
+		struct lowlevel_device_info * const infolist = lowlevel_scan(), *info, *infotmp;
+		
+		LL_FOREACH_SAFE(infolist, info, infotmp)
+			probe_device(info);
+		LL_FOREACH_SAFE(infolist, info, infotmp)
+			pthread_join(info->probe_pth, NULL);
+	}
 #endif
 	
 	struct driver_registration *reg, *tmp;
-	const int algomatch = opt_scrypt ? POW_SCRYPT : POW_SHA256D;
 	BFG_FOREACH_DRIVER_BY_PRIORITY(reg, tmp)
 	{
 		const struct device_drv * const drv = reg->drv;
@@ -10723,13 +10661,25 @@ rescan:
 	}
 
 #ifdef HAVE_BFG_LOWLEVEL
-	lowlevel_scan_free();
+	if (!opt_scrypt)
+		lowlevel_scan_free();
 #endif
 	
 	if (bfg_need_detect_rescan)
 	{
-		applog(LOG_DEBUG, "Device rescan requested");
-		goto rescan;
+		if (rescanning)
+		{
+			applog(LOG_DEBUG, "Device rescan requested a second time, delaying");
+			struct timeval tv_when;
+			timer_set_delay_from_now(&tv_when, rescan_delay_ms * 1000);
+			schedule_rescan(&tv_when);
+		}
+		else
+		{
+			rescanning = true;
+			applog(LOG_DEBUG, "Device rescan requested");
+			goto rescan;
+		}
 	}
 }
 
@@ -10740,8 +10690,6 @@ void allocate_cgpu(struct cgpu_info *cgpu, unsigned int *kp)
 	int j;
 	
 	struct device_drv *api = cgpu->drv;
-	if (!cgpu->devtype)
-		cgpu->devtype = "PGA";
 	cgpu->cgminer_stats.getwork_wait_min.tv_sec = MIN_SEC_UNSET;
 	
 	int threadobj = cgpu->threads;
@@ -10768,6 +10716,10 @@ void allocate_cgpu(struct cgpu_info *cgpu, unsigned int *kp)
 	}
 
 	cgpu->max_hashes = 0;
+	BFGINIT(cgpu->min_nonce_diff, 1);
+	
+	BFGINIT(cgpu->cutofftemp, opt_cutofftemp);
+	BFGINIT(cgpu->targettemp, cgpu->cutofftemp - 6);
 
 	// Setup thread structs before starting any of the threads, in case they try to interact
 	for (j = 0; j < threadobj; ++j, ++*kp) {
@@ -10941,6 +10893,9 @@ void *probe_device_thread(void *p)
 			const size_t dnamelen = (colon - dname);
 			if (_probe_device_internal(info, dname, dnamelen))
 				return NULL;
+			else
+			if (opt_hotplug)
+				bfg_need_detect_rescan = true;
 		}
 	}
 	
@@ -10977,6 +10932,9 @@ void *probe_device_thread(void *p)
 					continue;
 				if (drv->lowl_probe(info))
 					return NULL;
+				else
+				if (opt_hotplug)
+					bfg_need_detect_rescan = true;
 			}
 		}
 	}
@@ -11007,6 +10965,8 @@ void *probe_device_thread(void *p)
 						if (drv->lowl_probe(info))
 							return NULL;
 					}
+					if (opt_hotplug)
+						bfg_need_detect_rescan = true;
 					break;
 				}
 			}
@@ -11039,7 +10999,6 @@ int create_new_cgpus(void (*addfunc)(void*), void *arg)
 	struct cgpu_info *cgpu;
 	struct thr_info *thr;
 	void *p;
-	char *dummy = "\0";
 	
 	mutex_lock(&mutex);
 	devcount = total_devices;
@@ -11092,8 +11051,13 @@ int create_new_cgpus(void (*addfunc)(void*), void *arg)
 	for (i = 0; i < total_devices_new; ++i)
 	{
 		cgpu = devices_new[i];
-		load_temp_config_cgpu(cgpu, &dummy, &dummy);
+		
 		allocate_cgpu(cgpu, &k);
+	}
+	for (i = 0; i < total_devices_new; ++i)
+	{
+		cgpu = devices_new[i];
+		
 		start_cgpu(cgpu);
 		register_device(cgpu);
 		++total_devices;
@@ -11116,6 +11080,216 @@ int scan_serial(const char *s)
 {
 	return create_new_cgpus(_scan_serial, (void*)s);
 }
+
+static pthread_mutex_t rescan_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool rescan_active;
+static struct timeval tv_rescan;
+static notifier_t rescan_notifier;
+
+static
+void *rescan_thread(__maybe_unused void *p)
+{
+	pthread_detach(pthread_self());
+	RenameThread("rescan");
+	
+	struct timeval tv_timeout, tv_now;
+	fd_set rfds;
+	
+	while (true)
+	{
+		mutex_lock(&rescan_mutex);
+		tv_timeout = tv_rescan;
+		if (!timer_isset(&tv_timeout))
+		{
+			rescan_active = false;
+			mutex_unlock(&rescan_mutex);
+			break;
+		}
+		mutex_unlock(&rescan_mutex);
+		
+		FD_ZERO(&rfds);
+		FD_SET(rescan_notifier[0], &rfds);
+		const int maxfd = rescan_notifier[0];
+		
+		timer_set_now(&tv_now);
+		if (select(maxfd+1, &rfds, NULL, NULL, select_timeout(&tv_timeout, &tv_now)) > 0)
+			notifier_read(rescan_notifier);
+		
+		mutex_lock(&rescan_mutex);
+		if (timer_passed(&tv_rescan, NULL))
+		{
+			timer_unset(&tv_rescan);
+			mutex_unlock(&rescan_mutex);
+			applog(LOG_DEBUG, "Rescan timer expired, triggering");
+			scan_serial(NULL);
+		}
+		else
+			mutex_unlock(&rescan_mutex);
+	}
+	return NULL;
+}
+
+static
+void _schedule_rescan(const struct timeval * const tvp_when)
+{
+	if (rescan_active)
+	{
+		if (timercmp(tvp_when, &tv_rescan, <))
+			applog(LOG_DEBUG, "schedule_rescan: New schedule is before current, waiting it out");
+		else
+		{
+			applog(LOG_DEBUG, "schedule_rescan: New schedule is after current, delaying rescan");
+			tv_rescan = *tvp_when;
+		}
+		return;
+	}
+	
+	applog(LOG_DEBUG, "schedule_rescan: Scheduling rescan (no rescans currently pending)");
+	tv_rescan = *tvp_when;
+	rescan_active = true;
+	
+	static pthread_t pth;
+	if (unlikely(pthread_create(&pth, NULL, rescan_thread, NULL)))
+		applog(LOG_ERR, "Failed to start rescan thread");
+}
+
+static
+void schedule_rescan(const struct timeval * const tvp_when)
+{
+	mutex_lock(&rescan_mutex);
+	_schedule_rescan(tvp_when);
+	mutex_unlock(&rescan_mutex);
+}
+
+#ifdef HAVE_BFG_HOTPLUG
+static
+void hotplug_trigger()
+{
+	applog(LOG_DEBUG, "%s: Scheduling rescan immediately", __func__);
+	struct timeval tv_now;
+	timer_set_now(&tv_now);
+	schedule_rescan(&tv_now);
+}
+#endif
+
+#if defined(HAVE_LIBUDEV) && defined(HAVE_SYS_EPOLL_H)
+
+static
+void *hotplug_thread(__maybe_unused void *p)
+{
+	pthread_detach(pthread_self());
+	RenameThread("hotplug");
+	
+	struct udev * const udev = udev_new();
+	if (unlikely(!udev))
+		applogfailr(NULL, LOG_ERR, "udev_new");
+	struct udev_monitor * const mon = udev_monitor_new_from_netlink(udev, "udev");
+	if (unlikely(!mon))
+		applogfailr(NULL, LOG_ERR, "udev_monitor_new_from_netlink");
+	if (unlikely(udev_monitor_enable_receiving(mon)))
+		applogfailr(NULL, LOG_ERR, "udev_monitor_enable_receiving");
+	const int epfd = epoll_create(1);
+	if (unlikely(epfd == -1))
+		applogfailr(NULL, LOG_ERR, "epoll_create");
+	{
+		const int fd = udev_monitor_get_fd(mon);
+		struct epoll_event ev = {
+			.events = EPOLLIN | EPOLLPRI,
+			.data.fd = fd,
+		};
+		if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev))
+			applogfailr(NULL, LOG_ERR, "epoll_ctl");
+	}
+	
+	struct epoll_event ev;
+	int rv;
+	bool pending = false;
+	while (true)
+	{
+		rv = epoll_wait(epfd, &ev, 1, pending ? hotplug_delay_ms : -1);
+		if (rv == -1)
+		{
+			if (errno == EAGAIN || errno == EINTR)
+				continue;
+			break;
+		}
+		if (!rv)
+		{
+			hotplug_trigger();
+			pending = false;
+			continue;
+		}
+		struct udev_device * const device = udev_monitor_receive_device(mon);
+		if (!device)
+			continue;
+		const char * const action = udev_device_get_action(device);
+		applog(LOG_DEBUG, "%s: Received %s event", __func__, action);
+		if (strcmp(action, "add"))
+			continue;
+		
+		pending = true;
+	}
+	
+	applogfailr(NULL, LOG_ERR, "epoll_wait");
+}
+
+#elif defined(WIN32)
+
+static UINT_PTR _hotplug_wintimer_id;
+
+VOID CALLBACK hotplug_win_timer(HWND hwnd, UINT msg, UINT_PTR idEvent, DWORD dwTime)
+{
+	KillTimer(NULL, _hotplug_wintimer_id);
+	_hotplug_wintimer_id = 0;
+	hotplug_trigger();
+}
+
+LRESULT CALLBACK hotplug_win_callback(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (msg == WM_DEVICECHANGE && wParam == DBT_DEVNODES_CHANGED)
+	{
+		applog(LOG_DEBUG, "%s: Received DBT_DEVNODES_CHANGED event", __func__);
+		_hotplug_wintimer_id = SetTimer(NULL, _hotplug_wintimer_id, hotplug_delay_ms, hotplug_win_timer);
+	}
+	return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static
+void *hotplug_thread(__maybe_unused void *p)
+{
+	pthread_detach(pthread_self());
+	
+	WNDCLASS DummyWinCls = {
+		.lpszClassName = "BFGDummyWinCls",
+		.lpfnWndProc = hotplug_win_callback,
+	};
+	ATOM a = RegisterClass(&DummyWinCls);
+	if (unlikely(!a))
+		applogfailinfor(NULL, LOG_ERR, "RegisterClass", "%d", (int)GetLastError());
+	HWND hwnd = CreateWindow((void*)(intptr_t)a, NULL, WS_OVERLAPPED, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, NULL, NULL, NULL, NULL);
+	if (unlikely(!hwnd))
+		applogfailinfor(NULL, LOG_ERR, "CreateWindow", "%d", (int)GetLastError());
+	MSG msg;
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+	quit(0, "WM_QUIT received");
+	return NULL;
+}
+
+#endif
+
+#ifdef HAVE_BFG_HOTPLUG
+static
+void hotplug_start()
+{
+	pthread_t pth;
+	if (unlikely(pthread_create(&pth, NULL, hotplug_thread, NULL)))
+		applog(LOG_ERR, "Failed to start hotplug thread");
+}
+#endif
 
 static void probe_pools(void)
 {
@@ -11177,6 +11351,7 @@ int main(int argc, char *argv[])
 	struct block *block;
 	unsigned int k;
 	int i;
+	int rearrange_pools = 0;
 	char *s;
 
 #ifdef WIN32
@@ -11189,6 +11364,7 @@ int main(int argc, char *argv[])
 #ifndef HAVE_PTHREAD_CANCEL
 	setup_pthread_cancel_workaround();
 #endif
+	bfg_init_checksums();
 
 #ifdef WIN32
 	{
@@ -11229,6 +11405,8 @@ int main(int argc, char *argv[])
 		quit(1, "Failed to pthread_cond_init gws_cond");
 
 	notifier_init(submit_waiting_notifier);
+	timer_unset(&tv_rescan);
+	notifier_init(rescan_notifier);
 
 	snprintf(packagename, sizeof(packagename), "%s %s", PACKAGE, VERSION);
 
@@ -11285,14 +11463,25 @@ int main(int argc, char *argv[])
 	mutex_init(&submitting_lock);
 
 #ifdef HAVE_OPENCL
-	memset(gpus, 0, sizeof(gpus));
-	for (i = 0; i < MAX_GPUDEVICES; i++)
-		gpus[i].dynamic = true;
+	opencl_early_init();
 #endif
 
 	schedstart.tm.tm_sec = 1;
 	schedstop .tm.tm_sec = 1;
 
+	opt_register_table(opt_early_table, NULL);
+	opt_register_table(opt_config_table, NULL);
+	opt_register_table(opt_cmdline_table, NULL);
+	opt_early_parse(argc, argv, applog_and_exit);
+	
+	if (!config_loaded)
+	{
+		load_default_config();
+		rearrange_pools = total_pools;
+	}
+	
+	opt_free_table();
+	
 	/* parse command line */
 	opt_register_table(opt_config_table,
 			   "Options for both config file and command line");
@@ -11302,9 +11491,15 @@ int main(int argc, char *argv[])
 	opt_parse(&argc, argv, applog_and_exit);
 	if (argc != 1)
 		quit(1, "Unexpected extra commandline arguments");
-
-	if (!config_loaded)
-		load_default_config();
+	
+	if (rearrange_pools && rearrange_pools < total_pools)
+	{
+		// Prioritise commandline pools before default-config pools
+		for (i = 0; i < rearrange_pools; ++i)
+			pools[i]->prio += rearrange_pools;
+		for ( ; i < total_pools; ++i)
+			pools[i]->prio -= rearrange_pools;
+	}
 
 #ifndef HAVE_PTHREAD_CANCEL
 	// Can't do this any earlier, or config isn't loaded
@@ -11348,8 +11543,6 @@ int main(int argc, char *argv[])
 	if (opt_benchmark) {
 		struct pool *pool;
 
-		if (opt_scrypt)
-			quit(1, "Cannot use benchmark mode with scrypt");
 		want_longpoll = false;
 		pool = add_pool();
 		pool->rpc_url = malloc(255);
@@ -11506,8 +11699,14 @@ int main(int argc, char *argv[])
 		else
 			applog(LOG_WARNING, "Waiting for devices");
 	}
-
-	load_temp_config();
+	
+	if (opt_quit_summary == BQS_DEFAULT)
+	{
+		if (total_devices < 25)
+			opt_quit_summary = BQS_PROCS;
+		else
+			opt_quit_summary = BQS_DEVS;
+	}
 
 #ifdef HAVE_CURSES
 	switch_logsize();
@@ -11687,6 +11886,7 @@ begin_bench:
 	cgtime(&total_tv_start);
 	cgtime(&total_tv_end);
 
+	if (!opt_benchmark)
 	{
 		pthread_t submit_thread;
 		if (unlikely(pthread_create(&submit_thread, NULL, submit_work_thread, NULL)))
@@ -11734,6 +11934,11 @@ begin_bench:
 		stratumsrv_start();
 #endif
 
+#ifdef HAVE_BFG_HOTPLUG
+	if (opt_hotplug && !opt_scrypt)
+		hotplug_start();
+#endif
+
 #ifdef HAVE_CURSES
 	/* Create curses input thread for keyboard input. Create this last so
 	 * that we know all threads are created since this can call kill_work
@@ -11759,10 +11964,8 @@ begin_bench:
 
 		cp = current_pool();
 
-		/* If the primary pool is a getwork pool and cannot roll work,
-		 * try to stage one extra work per mining thread */
-		if (!pool_localgen(cp) && !staged_rollable)
-			max_staged += mining_threads;
+		// Generally, each processor needs a new work, and all at once during work restarts
+		max_staged += mining_threads;
 
 		mutex_lock(stgd_lock);
 		ts = __total_staged();

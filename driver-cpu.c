@@ -209,7 +209,6 @@ static const sha256_func sha256_funcs[] = {
 
 #ifdef WANT_CPUMINE
 enum sha256_algos opt_algo = ALGO_FASTAUTO;
-bool opt_usecpu = false;
 static bool forced_n_threads;
 #endif
 
@@ -765,7 +764,6 @@ static int cpu_autodetect()
 
 		cgpu = &cpus[i];
 		cgpu->drv = &cpu_drv;
-		cgpu->devtype = "CPU";
 		cgpu->deven = DEV_ENABLED;
 		cgpu->threads = 1;
 		cgpu->kname = algo_names[opt_algo];
@@ -815,6 +813,9 @@ static bool cpu_thread_init(struct thr_info *thr)
 	mutex_unlock(&cpualgo_lock);
 
 	cgpu->kname = algo_names[opt_algo];
+	
+	if (opt_algo == ALGO_SCRYPT)
+		cgpu->min_nonce_diff = 1./0x10000;
 	
 	/* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
 	 * and if that fails, then SCHED_BATCH. No need for this to be an

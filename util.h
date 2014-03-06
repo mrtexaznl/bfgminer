@@ -10,8 +10,8 @@
  * any later version.  See COPYING for more details.
  */
 
-#ifndef __UTIL_H__
-#define __UTIL_H__
+#ifndef BFG_UTIL_H
+#define BFG_UTIL_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -180,6 +180,8 @@ enum bfg_strerror_type {
 	BST_SYSTEM,
 };
 extern const char *bfg_strerror(int, enum bfg_strerror_type);
+
+extern void *bfg_slurp_file(void *buf, size_t bufsz, const char *filename);
 
 typedef SOCKETTYPE notifier_t[2];
 extern void notifier_init(notifier_t);
@@ -496,8 +498,15 @@ void maybe_strdup_if_null(const char **p, const char *s)
 		*p = maybe_strdup(s);
 }
 
+extern char *trimmed_strdup(const char *);
+
 
 extern void run_cmd(const char *cmd);
+
+
+extern uint8_t crc5usb(unsigned char *ptr, uint8_t len);
+extern void bfg_init_checksums(void);
+extern uint8_t crc8ccitt(const void *, size_t);
 
 
 #endif /* __UTIL_H__ */

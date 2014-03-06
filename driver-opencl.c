@@ -22,16 +22,18 @@
 #include <windows.h>
 #endif
 
+#include <ctype.h>
+#include <math.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <sys/types.h>
 
 #ifndef WIN32
 #include <sys/resource.h>
 #endif
-#include <ccan/opt/opt.h>
 
 #define OMIT_OPENCL_API
 
@@ -270,6 +272,7 @@ extern char *opt_kernel_path;
 extern int gpur_thr_id;
 extern bool opt_noadl;
 extern bool have_opencl;
+static _clState *clStates[MAX_GPUDEVICES];
 
 
 
@@ -287,152 +290,87 @@ extern int gpu_fanpercent(int gpu);
 #endif
 
 
-#ifdef HAVE_SENSORS
-#include <sensors/sensors.h>
+void opencl_early_init()
+{
+	static struct opencl_device_data dataarray[MAX_GPUDEVICES];
+	for (int i = 0; i < MAX_GPUDEVICES; ++i)
+	{
+		struct opencl_device_data * const data = &dataarray[i];
+		*data = (struct opencl_device_data){
+			.dynamic = true,
+		};
+		gpus[i] = (struct cgpu_info){
+			.device_data = data,
+		};
+	}
+}
 
-struct opencl_device_data {
-	const sensors_chip_name *sensor;
-};
-#endif
+static
+const char *_set_list(char * const arg, const char * const emsg, bool (*set_func)(struct cgpu_info *, const char *))
+{
+	int i, device = 0;
+	char *nextptr, buf[0x10];
 
+	nextptr = strtok(arg, ",");
+	if (nextptr == NULL)
+		return emsg;
+	if (!set_func(&gpus[device++], nextptr))
+		return emsg;
+	snprintf(buf, sizeof(buf), "%s", nextptr);
+
+	while ((nextptr = strtok(NULL, ",")) != NULL)
+		if (!set_func(&gpus[device++], nextptr))
+			return emsg;
+	if (device == 1) {
+		for (i = device; i < MAX_GPUDEVICES; i++)
+			set_func(&gpus[i], buf);
+	}
+
+	return NULL;
+}
+
+#define _SET_INTERFACE(PNAME)  \
+static  \
+const char *opencl_init_ ## PNAME (struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)  \
+{  \
+	if (!_set_ ## PNAME (proc, newvalue))  \
+		return "Invalid value for " #PNAME;  \
+	return NULL;  \
+}  \
+// END OF _SET_INTERFACE
+
+#define _SET_INT_LIST2(PNAME, VCHECK, FIELD)  \
+static  \
+bool _set_ ## PNAME (struct cgpu_info * const cgpu, const char * const _val)  \
+{  \
+	const int v = atoi(_val);  \
+	if (!(VCHECK))  \
+		return false;  \
+	FIELD = v;  \
+	return true;  \
+}  \
+_SET_INTERFACE(PNAME)  \
+const char *set_ ## PNAME(char *arg)  \
+{  \
+	return _set_list(arg, "Invalid value passed to " #PNAME, _set_ ## PNAME);  \
+}  \
+// END OF _SET_INT_LIST
+
+#define _SET_INT_LIST(PNAME, VCHECK, FIELD)  \
+	_SET_INT_LIST2(PNAME, VCHECK, ((struct opencl_device_data *)cgpu->device_data)->FIELD)
 
 #ifdef HAVE_OPENCL
-char *set_vector(char *arg)
-{
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set vector";
-	val = atoi(nextptr);
-	if (val != 1 && val != 2 && val != 4)
-		return "Invalid value passed to set_vector";
-
-	gpus[device++].vwidth = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-		if (val != 1 && val != 2 && val != 4)
-			return "Invalid value passed to set_vector";
-
-		gpus[device++].vwidth = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].vwidth = gpus[0].vwidth;
-	}
-
-	return NULL;
-}
-
-char *set_worksize(char *arg)
-{
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set work size";
-	val = atoi(nextptr);
-	if (val < 1 || val > 9999)
-		return "Invalid value passed to set_worksize";
-
-	gpus[device++].work_size = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-		if (val < 1 || val > 9999)
-			return "Invalid value passed to set_worksize";
-
-		gpus[device++].work_size = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].work_size = gpus[0].work_size;
-	}
-
-	return NULL;
-}
+_SET_INT_LIST(vector  , (v == 1 || v == 2 || v == 4), vwidth   )
+_SET_INT_LIST(worksize, (v >= 1 && v <= 9999)       , work_size)
 
 #ifdef USE_SCRYPT
-char *set_shaders(char *arg)
-{
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set lookup gap";
-	val = atoi(nextptr);
-
-	gpus[device++].shaders = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-
-		gpus[device++].shaders = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].shaders = gpus[0].shaders;
-	}
-
-	return NULL;
-}
-
-char *set_lookup_gap(char *arg)
-{
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set lookup gap";
-	val = atoi(nextptr);
-
-	gpus[device++].opt_lg = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-
-		gpus[device++].opt_lg = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].opt_lg = gpus[0].opt_lg;
-	}
-
-	return NULL;
-}
-
-char *set_thread_concurrency(char *arg)
-{
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set thread concurrency";
-	val = atoi(nextptr);
-
-	gpus[device++].opt_tc = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-
-		gpus[device++].opt_tc = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].opt_tc = gpus[0].opt_tc;
-	}
-
-	return NULL;
-}
+_SET_INT_LIST(shaders           , true, shaders)
+_SET_INT_LIST(lookup_gap        , true, opt_lg )
+_SET_INT_LIST(thread_concurrency, true, opt_tc )
 #endif
 
-static enum cl_kernels select_kernel(char *arg)
+static
+enum cl_kernels select_kernel(const char * const arg)
 {
 	if (!strcmp(arg, "diablo"))
 		return KL_DIABLO;
@@ -449,43 +387,40 @@ static enum cl_kernels select_kernel(char *arg)
 	return KL_NONE;
 }
 
-char *set_kernel(char *arg)
+static
+bool _set_kernel(struct cgpu_info * const cgpu, const char * const _val)
 {
-	enum cl_kernels kern;
-	int i, device = 0;
-	char *nextptr;
-
+	const enum cl_kernels kern = select_kernel(_val);
+	if (kern == KL_NONE)
+		return false;
+	struct opencl_device_data * const data = cgpu->device_data;
+	data->kernel = kern;
+	return true;
+}
+_SET_INTERFACE(kernel)
+const char *set_kernel(char *arg)
+{
 	if (opt_scrypt)
 		return "Cannot specify a kernel with scrypt";
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set kernel";
-	kern = select_kernel(nextptr);
-	if (kern == KL_NONE)
-		return "Invalid parameter to set_kernel";
-	gpus[device++].kernel = kern;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		kern = select_kernel(nextptr);
-		if (kern == KL_NONE)
-			return "Invalid parameter to set_kernel";
-
-		gpus[device++].kernel = kern;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].kernel = gpus[0].kernel;
-	}
-
-	return NULL;
+	return _set_list(arg, "Invalid value passed to set_kernel", _set_kernel);
 }
 #endif
 
 #ifdef HAVE_ADL
 /* This function allows us to map an adl device to an opencl device for when
  * simple enumeration has failed to match them. */
+static
+const char *opencl_init_gpu_map(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct opencl_device_data * const data = proc->device_data;
+	data->virtual_adl = atoi(newvalue);
+	data->mapped = true;
+	return NULL;
+}
+
 char *set_gpu_map(char *arg)
 {
+	struct opencl_device_data *data;
 	int val1 = 0, val2 = 0;
 	char *nextptr;
 
@@ -497,293 +432,280 @@ char *set_gpu_map(char *arg)
 	if (val1 < 0 || val1 > MAX_GPUDEVICES || val2 < 0 || val2 > MAX_GPUDEVICES)
 		return "Invalid value passed to set_gpu_map";
 
-	gpus[val1].virtual_adl = val2;
-	gpus[val1].mapped = true;
+	data = gpus[val1].device_data;
+	data->virtual_adl = val2;
+	data->mapped = true;
 
 	while ((nextptr = strtok(NULL, ",")) != NULL) {
 		if (sscanf(nextptr, "%d:%d", &val1, &val2) != 2)
 			return "Invalid description for map pair";
 		if (val1 < 0 || val1 > MAX_GPUDEVICES || val2 < 0 || val2 > MAX_GPUDEVICES)
 			return "Invalid value passed to set_gpu_map";
-		gpus[val1].virtual_adl = val2;
-		gpus[val1].mapped = true;
+		data = gpus[val1].device_data;
+		data->virtual_adl = val2;
+		data->mapped = true;
 	}
 
 	return NULL;
 }
 
-char *set_gpu_engine(char *arg)
+static
+bool _set_gpu_engine(struct cgpu_info * const cgpu, const char * const _val)
 {
-	int i, val1 = 0, val2 = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set gpu engine";
-	get_intrange(nextptr, &val1, &val2);
-	if (val1 < 0 || val1 > 9999 || val2 < 0 || val2 > 9999)
-		return "Invalid value passed to set_gpu_engine";
-
-	gpus[device].min_engine = val1;
-	gpus[device].gpu_engine = val2;
-	device++;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		get_intrange(nextptr, &val1, &val2);
-		if (val1 < 0 || val1 > 9999 || val2 < 0 || val2 > 9999)
-			return "Invalid value passed to set_gpu_engine";
-		gpus[device].min_engine = val1;
-		gpus[device].gpu_engine = val2;
-		device++;
+	int val1, val2;
+	get_intrange(_val, &val1, &val2);
+	if (val1 < 0 || val1 > 9999 || val2 < 0 || val2 > 9999 || val2 < val1)
+		return false;
+	
+	struct opencl_device_data * const data = cgpu->device_data;
+	struct gpu_adl * const ga = &data->adl;
+	
+	data->min_engine = val1;
+	data->gpu_engine = val2;
+	ga->autoengine = (val1 != val2);
+	return true;
+}
+_SET_INTERFACE(gpu_engine)
+const char *set_gpu_engine(char *arg)
+{
+	return _set_list(arg, "Invalid value passed to set_gpu_engine", _set_gpu_engine);
+}
+static
+const char *opencl_set_gpu_engine(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct opencl_device_data * const data = proc->device_data;
+	struct gpu_adl * const ga = &data->adl;
+	
+	int val1, val2;
+	get_intrange(newvalue, &val1, &val2);
+	if (val1 < 0 || val1 > 100 || val2 < 0 || val2 > 100 || val2 < val1)
+		return "Invalid value for clock";
+	
+	if (val1 == val2)
+	{
+		if (set_engineclock(proc->device_id, val1))
+			return "Failed to set gpu_engine";
+		ga->autoengine = false;
 	}
-
-	if (device == 1) {
-		for (i = 1; i < MAX_GPUDEVICES; i++) {
-			gpus[i].min_engine = gpus[0].min_engine;
-			gpus[i].gpu_engine = gpus[0].gpu_engine;
+	else
+	{
+		// Ensure current clock is within range
+		if (ga->lastengine < val1)
+		{
+			if (set_engineclock(proc->device_id, val1))
+				return "Failed to set gpu_engine";
 		}
+		else
+		if (ga->lastengine > val2)
+			if (set_engineclock(proc->device_id, val2))
+				return "Failed to set gpu_engine";
+		
+		data->min_engine = val1;
+		data->gpu_engine = val2;
+		ga->autoengine = true;
 	}
-
+	
 	return NULL;
 }
 
-char *set_gpu_fan(char *arg)
+static
+bool _set_gpu_fan(struct cgpu_info * const cgpu, const char * const _val)
 {
-	int i, val1 = 0, val2 = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set gpu fan";
-	get_intrange(nextptr, &val1, &val2);
-	if (val1 < 0 || val1 > 100 || val2 < 0 || val2 > 100)
-		return "Invalid value passed to set_gpu_fan";
-
-	gpus[device].min_fan = val1;
-	gpus[device].gpu_fan = val2;
-	device++;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		get_intrange(nextptr, &val1, &val2);
-		if (val1 < 0 || val1 > 100 || val2 < 0 || val2 > 100)
-			return "Invalid value passed to set_gpu_fan";
-
-		gpus[device].min_fan = val1;
-		gpus[device].gpu_fan = val2;
-		device++;
+	int val1, val2;
+	get_intrange(_val, &val1, &val2);
+	if (val1 < 0 || val1 > 100 || val2 < 0 || val2 > 100 || val2 < val1)
+		return false;
+	
+	struct opencl_device_data * const data = cgpu->device_data;
+	struct gpu_adl * const ga = &data->adl;
+	
+	data->min_fan = val1;
+	data->gpu_fan = val2;
+	ga->autofan = (val1 != val2);
+	return true;
+}
+_SET_INTERFACE(gpu_fan)
+const char *set_gpu_fan(char *arg)
+{
+	return _set_list(arg, "Invalid value passed to set_gpu_fan", _set_gpu_fan);
+}
+static
+const char *opencl_set_gpu_fan(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct opencl_device_data * const data = proc->device_data;
+	struct gpu_adl * const ga = &data->adl;
+	
+	int val1, val2;
+	get_intrange(newvalue, &val1, &val2);
+	if (val1 < 0 || val1 > 100 || val2 < 0 || val2 > 100 || val2 < val1)
+		return "Invalid value for fan";
+	
+	if (val1 == val2)
+	{
+		if (set_fanspeed(proc->device_id, val1))
+			return "Failed to set gpu_fan";
+		ga->autofan = false;
 	}
-
-	if (device == 1) {
-		for (i = 1; i < MAX_GPUDEVICES; i++) {
-			gpus[i].min_fan = gpus[0].min_fan;
-			gpus[i].gpu_fan = gpus[0].gpu_fan;
+	else
+	{
+		// Ensure current fan is within range
+		if (ga->targetfan < val1)
+		{
+			if (set_fanspeed(proc->device_id, val1))
+				return "Failed to set gpu_fan";
 		}
+		else
+		if (ga->targetfan > val2)
+			if (set_fanspeed(proc->device_id, val2))
+				return "Failed to set gpu_fan";
+		
+		data->min_fan = val1;
+		data->gpu_fan = val2;
+		ga->autofan = true;
 	}
-
+	
 	return NULL;
 }
 
-char *set_gpu_memclock(char *arg)
+_SET_INT_LIST(gpu_memclock , (v >=     1 && v <  9999), gpu_memclock )
+static
+const char *opencl_set_gpu_memclock(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
 {
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set gpu memclock";
-	val = atoi(nextptr);
-	if (val < 0 || val >= 9999)
-		return "Invalid value passed to set_gpu_memclock";
-
-	gpus[device++].gpu_memclock = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-		if (val < 0 || val >= 9999)
-			return "Invalid value passed to set_gpu_memclock";
-
-		gpus[device++].gpu_memclock = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].gpu_memclock = gpus[0].gpu_memclock;
-	}
-
+	if (set_memoryclock(proc->device_id, atoi(newvalue)))
+		return "Failed to set gpu_memclock";
 	return NULL;
 }
 
-char *set_gpu_memdiff(char *arg)
+_SET_INT_LIST(gpu_memdiff  , (v >= -9999 && v <= 9999), gpu_memdiff  )
+static
+const char *opencl_set_gpu_memdiff(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
 {
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set gpu memdiff";
-	val = atoi(nextptr);
-	if (val < -9999 || val > 9999)
-		return "Invalid value passed to set_gpu_memdiff";
-
-	gpus[device++].gpu_memdiff = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-		if (val < -9999 || val > 9999)
-			return "Invalid value passed to set_gpu_memdiff";
-
-		gpus[device++].gpu_memdiff = val;
-	}
-		if (device == 1) {
-			for (i = device; i < MAX_GPUDEVICES; i++)
-				gpus[i].gpu_memdiff = gpus[0].gpu_memdiff;
-		}
-
-			return NULL;
-}
-
-char *set_gpu_powertune(char *arg)
-{
-	int i, val = 0, device = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set gpu powertune";
-	val = atoi(nextptr);
-	if (val < -99 || val > 99)
-		return "Invalid value passed to set_gpu_powertune";
-
-	gpus[device++].gpu_powertune = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-		if (val < -99 || val > 99)
-			return "Invalid value passed to set_gpu_powertune";
-
-		gpus[device++].gpu_powertune = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].gpu_powertune = gpus[0].gpu_powertune;
-	}
-
+	struct opencl_device_data * const data = proc->device_data;
+	
+	if (!_set_gpu_memdiff(proc, newvalue))
+		return "Invalid value for gpu_memdiff";
+	
+	set_engineclock(proc->device_id, data->gpu_engine);
+	
 	return NULL;
 }
 
-char *set_gpu_vddc(char *arg)
+_SET_INT_LIST(gpu_powertune, (v >=   -99 && v <=   99), gpu_powertune)
+_SET_INT_LIST(gpu_vddc     , (v >=     0 && v <  9999), gpu_vddc     )
+static
+const char *opencl_set_gpu_vddc(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
 {
-	int i, device = 0;
-	float val = 0;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set gpu vddc";
-	val = atof(nextptr);
-	if (val < 0 || val >= 9999)
-		return "Invalid value passed to set_gpu_vddc";
-
-	gpus[device++].gpu_vddc = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atof(nextptr);
-		if (val < 0 || val >= 9999)
-			return "Invalid value passed to set_gpu_vddc";
-
-		gpus[device++].gpu_vddc = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++)
-			gpus[i].gpu_vddc = gpus[0].gpu_vddc;
-	}
-
+	if (set_vddc(proc->device_id, atof(newvalue)))
+		return "Failed to set gpu_vddc";
 	return NULL;
 }
 
-char *set_temp_overheat(char *arg)
-{
-	int i, val = 0, device = 0, *to;
-	char *nextptr;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set temp overheat";
-	val = atoi(nextptr);
-	if (val < 0 || val > 200)
-		return "Invalid value passed to set temp overheat";
-
-	to = &gpus[device++].adl.overtemp;
-	*to = val;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		val = atoi(nextptr);
-		if (val < 0 || val > 200)
-			return "Invalid value passed to set temp overheat";
-
-		to = &gpus[device++].adl.overtemp;
-		*to = val;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++) {
-			to = &gpus[i].adl.overtemp;
-			*to = val;
-		}
-	}
-
-	return NULL;
-}
+_SET_INT_LIST(temp_overheat, (v >=     0 && v <   200), adl.overtemp )
 #endif
 
 #ifdef HAVE_OPENCL
-char *set_intensity(char *arg)
+// SHA256d "intensity" has an artificial offset of -15
+double oclthreads_to_intensity(const unsigned long oclthreads, const bool is_sha256d)
 {
-	int i, device = 0, *tt;
-	char *nextptr, val = 0;
-
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set intensity";
-	if (!strncasecmp(nextptr, "d", 1))
-		gpus[device].dynamic = true;
-	else {
-		gpus[device].dynamic = false;
-		val = atoi(nextptr);
-		if (val < MIN_INTENSITY || val > MAX_GPU_INTENSITY)
-			return "Invalid value passed to set intensity";
-		tt = &gpus[device].intensity;
-		*tt = val;
-	}
-
-	device++;
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		if (!strncasecmp(nextptr, "d", 1))
-			gpus[device].dynamic = true;
-		else {
-			gpus[device].dynamic = false;
-			val = atoi(nextptr);
-			if (val < MIN_INTENSITY || val > MAX_GPU_INTENSITY)
-				return "Invalid value passed to set intensity";
-
-			tt = &gpus[device].intensity;
-			*tt = val;
-		}
-		device++;
-	}
-	if (device == 1) {
-		for (i = device; i < MAX_GPUDEVICES; i++) {
-			gpus[i].dynamic = gpus[0].dynamic;
-			gpus[i].intensity = gpus[0].intensity;
-		}
-	}
-
-	return NULL;
+	double intensity = log2(oclthreads);
+	if (is_sha256d)
+		intensity -= 15.;
+	return intensity;
 }
+
+unsigned long intensity_to_oclthreads(double intensity, const bool is_sha256d)
+{
+	if (is_sha256d)
+		intensity += 15;
+	return pow(2, intensity);
+}
+
+double oclthreads_to_xintensity(const unsigned long oclthreads, const cl_uint max_compute_units)
+{
+	return (double)oclthreads / (double)max_compute_units / 64.;
+}
+
+unsigned long xintensity_to_oclthreads(const double xintensity, const cl_uint max_compute_units)
+{
+	return xintensity * max_compute_units * 0x40;
+}
+
+bool opencl_set_intensity_from_str(struct cgpu_info * const cgpu, const char *_val)
+{
+	struct opencl_device_data * const data = cgpu->device_data;
+	unsigned long oclthreads = 0;
+	bool dynamic = false;
+	
+	if (!strncasecmp(_val, "d", 1))
+	{
+		dynamic = true;
+		++_val;
+	}
+	
+	if (!strncasecmp(_val, "x", 1))
+	{
+		const double v = atof(&_val[1]);
+		if (v < 1 || v > 9999)
+			return false;
+		
+		// thr etc won't be initialised here, so avoid dereferencing it
+		if (data->oclthreads)
+		{
+			struct thr_info * const thr = cgpu->thr[0];
+			const int thr_id = thr->id;
+			_clState * const clState = clStates[thr_id];
+			
+			oclthreads = xintensity_to_oclthreads(v, clState->max_compute_units);
+		}
+	}
+	else
+	if (isdigit(_val[0]))
+	{
+		const double v = atof(_val);
+		if (v < MIN_INTENSITY || v > MAX_GPU_INTENSITY)
+			return false;
+		oclthreads = intensity_to_oclthreads(v, !opt_scrypt);
+	}
+	
+	// Make actual assignments after we know the values are valid
+	data->dynamic = dynamic;
+	if (data->oclthreads)
+	{
+		data->oclthreads = oclthreads;
+		pause_dynamic_threads(cgpu->device_id);
+	}
+	else
+	{
+		if (unlikely(data->_init_intensity))
+			free(data->_init_intensity);
+		data->_init_intensity = strdup(_val);
+	}
+	
+	return true;
+}
+#define _set_intensity opencl_set_intensity_from_str
+_SET_INTERFACE(intensity)
+const char *set_intensity(char *arg)
+{
+	return _set_list(arg, "Invalid value passed to intensity", _set_intensity);
+}
+
+_SET_INT_LIST2(gpu_threads, (v >= 1 && v <= 10), cgpu->threads)
 #endif
+
+void write_config_opencl(FILE * const fcfg)
+{
+#ifdef HAVE_ADL
+	if (opt_reorder)
+		fprintf(fcfg, ",\n\"gpu-reorder\" : true");
+#endif
+}
 
 
 #ifdef HAVE_OPENCL
 BFG_REGISTER_DRIVER(opencl_api)
+static const struct bfg_set_device_definition opencl_set_device_funcs_probe[];
+static const struct bfg_set_device_definition opencl_set_device_funcs[];
 
 char *print_ndevs_and_exit(int *ndevs)
 {
@@ -809,19 +731,19 @@ struct cgpu_info *cpus;
 void pause_dynamic_threads(int gpu)
 {
 	struct cgpu_info *cgpu = &gpus[gpu];
+	struct opencl_device_data * const data = cgpu->device_data;
 	int i;
 
 	for (i = 1; i < cgpu->threads; i++) {
 		struct thr_info *thr;
 
 		thr = cgpu->thr[i];
-		if (!thr->pause && cgpu->dynamic) {
+		if (!thr->pause && data->dynamic) {
 			applog(LOG_WARNING, "Disabling extra threads due to dynamic mode.");
-			applog(LOG_WARNING, "Tune dynamic intensity with --gpu-dyninterval");
 		}
 
-		thr->pause = cgpu->dynamic;
-		if (!cgpu->dynamic && cgpu->deven != DEV_DISABLED)
+		thr->pause = data->dynamic;
+		if (!data->dynamic && cgpu->deven != DEV_DISABLED)
 			mt_enable(thr);
 	}
 }
@@ -835,7 +757,10 @@ struct device_drv opencl_api;
 static
 void opencl_wlogprint_status(struct cgpu_info *cgpu)
 {
-	struct thr_info *thr;
+	struct opencl_device_data * const data = cgpu->device_data;
+	struct thr_info *thr = cgpu->thr[0];
+	const int thr_id = thr->id;
+	_clState * const clState = clStates[thr_id];
 	int i;
 	char checkin[40];
 	double displayed_rolling;
@@ -843,37 +768,50 @@ void opencl_wlogprint_status(struct cgpu_info *cgpu)
 	char logline[255];
 	strcpy(logline, ""); // In case it has no data
 	
-	tailsprintf(logline, sizeof(logline), "I:%s%d  ", (cgpu->dynamic ? "d" : ""), cgpu->intensity);
+	{
+		double intensity = oclthreads_to_intensity(data->oclthreads, !opt_scrypt);
+		double xintensity = oclthreads_to_xintensity(data->oclthreads, clState->max_compute_units);
+		const char *iunit = "";
+		if (xintensity - (int)xintensity < intensity - (int)intensity)
+		{
+			intensity = xintensity;
+			iunit = "x";
+		}
+		tailsprintf(logline, sizeof(logline), "I:%s%s%g ",
+		            (data->dynamic ? "d" : ""),
+		            iunit,
+		            intensity);
+	}
 #ifdef HAVE_ADL
-	if (cgpu->has_adl) {
+	if (data->has_adl) {
 		int engineclock = 0, memclock = 0, activity = 0, fanspeed = 0, fanpercent = 0, powertune = 0;
 		float temp = 0, vddc = 0;
 
 		if (gpu_stats(cgpu->device_id, &temp, &engineclock, &memclock, &vddc, &activity, &fanspeed, &fanpercent, &powertune)) {
 			if (fanspeed != -1 || fanpercent != -1) {
-				tailsprintf(logline, sizeof(logline), "F: ");
+				tailsprintf(logline, sizeof(logline), "F:");
 				if (fanspeed > 9999)
 					fanspeed = 9999;
 				if (fanpercent != -1)
 				{
-					tailsprintf(logline, sizeof(logline), "%d%% ", fanpercent);
+					tailsprintf(logline, sizeof(logline), "%d%%", fanpercent);
 					if (fanspeed != -1)
-						tailsprintf(logline, sizeof(logline), "(%d RPM) ", fanspeed);
+						tailsprintf(logline, sizeof(logline), "(%dRPM)", fanspeed);
 				}
 				else
-					tailsprintf(logline, sizeof(logline), "%d RPM ", fanspeed);
+					tailsprintf(logline, sizeof(logline), "%dRPM", fanspeed);
 				tailsprintf(logline, sizeof(logline), " ");
 			}
 			if (engineclock != -1)
-				tailsprintf(logline, sizeof(logline), "E: %d MHz  ", engineclock);
+				tailsprintf(logline, sizeof(logline), "E:%dMHz ", engineclock);
 			if (memclock != -1)
-				tailsprintf(logline, sizeof(logline), "M: %d MHz  ", memclock);
+				tailsprintf(logline, sizeof(logline), "M:%dMHz ", memclock);
 			if (vddc != -1)
-				tailsprintf(logline, sizeof(logline), "V: %.3fV  ", vddc);
+				tailsprintf(logline, sizeof(logline), "V:%.3fV ", vddc);
 			if (activity != -1)
-				tailsprintf(logline, sizeof(logline), "A: %d%%  ", activity);
+				tailsprintf(logline, sizeof(logline), "A:%d%% ", activity);
 			if (powertune != -1)
-				tailsprintf(logline, sizeof(logline), "P: %d%%", powertune);
+				tailsprintf(logline, sizeof(logline), "P:%d%%", powertune);
 		}
 	}
 #endif
@@ -919,7 +857,8 @@ void opencl_tui_wlogprint_choices(struct cgpu_info *cgpu)
 {
 	wlogprint("[I]ntensity [R]estart GPU ");
 #ifdef HAVE_ADL
-	if (cgpu->has_adl)
+	struct opencl_device_data * const data = cgpu->device_data;
+	if (data->has_adl)
 		wlogprint("[C]hange settings ");
 #endif
 }
@@ -927,11 +866,12 @@ void opencl_tui_wlogprint_choices(struct cgpu_info *cgpu)
 static
 const char *opencl_tui_handle_choice(struct cgpu_info *cgpu, int input)
 {
+	struct opencl_device_data * const data = cgpu->device_data;
+	
 	switch (input)
 	{
 		case 'i': case 'I':
 		{
-			int intensity;
 			char *intvar;
 
 			if (opt_scrypt) {
@@ -946,18 +886,14 @@ const char *opencl_tui_handle_choice(struct cgpu_info *cgpu, int input)
 			if (!intvar)
 				return "Invalid intensity\n";
 			if (!strncasecmp(intvar, "d", 1)) {
-				cgpu->dynamic = true;
+				data->dynamic = true;
 				pause_dynamic_threads(cgpu->device_id);
 				free(intvar);
 				return "Dynamic mode enabled\n";
 			}
-			intensity = atoi(intvar);
-			free(intvar);
-			if (intensity < MIN_INTENSITY || intensity > MAX_INTENSITY)
+			if (!_set_intensity(cgpu, intvar))
 				return "Invalid intensity (out of range)\n";
-			cgpu->dynamic = false;
-			cgpu->intensity = intensity;
-			pause_dynamic_threads(cgpu->device_id);
+			free(intvar);
 			return "Intensity changed\n";
 		}
 		case 'r': case 'R':
@@ -985,14 +921,44 @@ const char *opencl_tui_handle_choice(struct cgpu_info *cgpu, int input)
 
 
 #ifdef HAVE_OPENCL
-static _clState *clStates[MAX_GPUDEVICES];
 
 #define CL_SET_BLKARG(blkvar) status |= clSetKernelArg(*kernel, num++, sizeof(uint), (void *)&blk->blkvar)
 #define CL_SET_ARG(var) status |= clSetKernelArg(*kernel, num++, sizeof(var), (void *)&var)
 #define CL_SET_VARG(args, var) status |= clSetKernelArg(*kernel, num++, args * sizeof(uint), (void *)var)
 
-static cl_int queue_poclbm_kernel(_clState *clState, dev_blk_ctx *blk, cl_uint threads)
+static
+void *_opencl_work_data_dup(struct work * const work)
 {
+	struct opencl_work_data *p = malloc(sizeof(*p));
+	memcpy(p, work->device_data, sizeof(*p));
+#ifdef USE_SCRYPT
+	p->work = work;
+#endif
+	return p;
+}
+
+static
+void _opencl_work_data_free(struct work * const work)
+{
+	free(work->device_data);
+}
+
+static
+struct opencl_work_data *_opencl_work_data(struct work * const work)
+{
+	if (!work->device_data)
+	{
+		work->device_data = calloc(1, sizeof(struct opencl_work_data));
+		work->device_data_dup_func = _opencl_work_data_dup;
+		work->device_data_free_func = _opencl_work_data_free;
+	}
+	return work->device_data;
+}
+
+static
+cl_int queue_poclbm_kernel(_clState * const clState, struct work * const work, const cl_uint threads)
+{
+	struct opencl_work_data * const blk = _opencl_work_data(work);
 	cl_kernel *kernel = &clState->kernel;
 	unsigned int num = 0;
 	cl_int status = 0;
@@ -1020,7 +986,7 @@ static cl_int queue_poclbm_kernel(_clState *clState, dev_blk_ctx *blk, cl_uint t
 		unsigned int i;
 
 		for (i = 0; i < vwidth; i++)
-			nonces[i] = blk->nonce + (i * threads);
+			nonces[i] = work->blk.nonce + (i * threads);
 		CL_SET_VARG(vwidth, nonces);
 	}
 
@@ -1044,9 +1010,10 @@ static cl_int queue_poclbm_kernel(_clState *clState, dev_blk_ctx *blk, cl_uint t
 	return status;
 }
 
-static cl_int queue_phatk_kernel(_clState *clState, dev_blk_ctx *blk,
-				 __maybe_unused cl_uint threads)
+static
+cl_int queue_phatk_kernel(_clState * const clState, struct work * const work, __maybe_unused const cl_uint threads)
 {
+	struct opencl_work_data * const blk = _opencl_work_data(work);
 	cl_kernel *kernel = &clState->kernel;
 	cl_uint vwidth = clState->vwidth;
 	unsigned int i, num = 0;
@@ -1071,7 +1038,7 @@ static cl_int queue_phatk_kernel(_clState *clState, dev_blk_ctx *blk,
 
 	nonces = alloca(sizeof(uint) * vwidth);
 	for (i = 0; i < vwidth; i++)
-		nonces[i] = blk->nonce + i;
+		nonces[i] = work->blk.nonce + i;
 	CL_SET_VARG(vwidth, nonces);
 
 	CL_SET_BLKARG(W16);
@@ -1088,9 +1055,10 @@ static cl_int queue_phatk_kernel(_clState *clState, dev_blk_ctx *blk,
 	return status;
 }
 
-static cl_int queue_diakgcn_kernel(_clState *clState, dev_blk_ctx *blk,
-				   __maybe_unused cl_uint threads)
+static
+cl_int queue_diakgcn_kernel(_clState * const clState, struct work * const work, __maybe_unused const cl_uint threads)
 {
+	struct opencl_work_data * const blk = _opencl_work_data(work);
 	cl_kernel *kernel = &clState->kernel;
 	unsigned int num = 0;
 	cl_int status = 0;
@@ -1100,7 +1068,7 @@ static cl_int queue_diakgcn_kernel(_clState *clState, dev_blk_ctx *blk,
 		uint *nonces = alloca(sizeof(uint) * vwidth);
 		unsigned int i;
 		for (i = 0; i < vwidth; i++)
-			nonces[i] = blk->nonce + i;
+			nonces[i] = work->blk.nonce + i;
 		CL_SET_VARG(vwidth, nonces);
 	}
 
@@ -1149,8 +1117,10 @@ static cl_int queue_diakgcn_kernel(_clState *clState, dev_blk_ctx *blk,
 	return status;
 }
 
-static cl_int queue_diablo_kernel(_clState *clState, dev_blk_ctx *blk, cl_uint threads)
+static
+cl_int queue_diablo_kernel(_clState * const clState, struct work * const work, const cl_uint threads)
 {
+	struct opencl_work_data * const blk = _opencl_work_data(work);
 	cl_kernel *kernel = &clState->kernel;
 	unsigned int num = 0;
 	cl_int status = 0;
@@ -1161,7 +1131,7 @@ static cl_int queue_diablo_kernel(_clState *clState, dev_blk_ctx *blk, cl_uint t
 		unsigned int i;
 
 		for (i = 0; i < vwidth; i++)
-			nonces[i] = blk->nonce + (i * threads);
+			nonces[i] = work->blk.nonce + (i * threads);
 		CL_SET_VARG(vwidth, nonces);
 	}
 
@@ -1203,16 +1173,17 @@ static cl_int queue_diablo_kernel(_clState *clState, dev_blk_ctx *blk, cl_uint t
 }
 
 #ifdef USE_SCRYPT
-static cl_int queue_scrypt_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_unused cl_uint threads)
+static
+cl_int queue_scrypt_kernel(_clState * const clState, struct work * const work, __maybe_unused const cl_uint threads)
 {
-	unsigned char *midstate = blk->work->midstate;
+	unsigned char *midstate = work->midstate;
 	cl_kernel *kernel = &clState->kernel;
 	unsigned int num = 0;
 	cl_uint le_target;
 	cl_int status = 0;
 
-	le_target = *(cl_uint *)(blk->work->target + 28);
-	clState->cldata = blk->work->data;
+	le_target = *(cl_uint *)(work->target + 28);
+	clState->cldata = work->data;
 	status = clEnqueueWriteBuffer(clState->commandQueue, clState->CLbuffer0, true, 0, 80, clState->cldata, 0, NULL,NULL);
 
 	CL_SET_ARG(clState->CLbuffer0);
@@ -1225,25 +1196,6 @@ static cl_int queue_scrypt_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_u
 	return status;
 }
 #endif
-
-static void set_threads_hashes(unsigned int vectors,int64_t *hashes, size_t *globalThreads,
-			       unsigned int minthreads, __maybe_unused int *intensity)
-{
-	unsigned int threads = 0;
-
-	while (threads < minthreads) {
-		threads = 1 << ((opt_scrypt ? 0 : 15) + *intensity);
-		if (threads < minthreads) {
-			if (likely(*intensity < MAX_INTENSITY))
-				(*intensity)++;
-			else
-				threads = minthreads;
-		}
-	}
-
-	*globalThreads = threads;
-	*hashes = threads * vectors;
-}
 #endif /* HAVE_OPENCL */
 
 
@@ -1270,6 +1222,8 @@ select_cgpu:
 	cgpu = tq_pop(mythr->q, NULL);
 	if (!cgpu)
 		goto out;
+	
+	struct opencl_device_data * const data = cgpu->device_data;
 
 	if (clDevicesNum() != nDevs) {
 		applog(LOG_WARNING, "Hardware not reporting same number of active devices, will not attempt to restart GPU");
@@ -1297,7 +1251,7 @@ select_cgpu:
 		thr = cgpu->thr[i];
 		thr_id = thr->id;
 
-		virtual_gpu = cgpu->virtual_gpu;
+		virtual_gpu = data->virtual_gpu;
 		/* Lose this ram cause we may get stuck here! */
 		//tq_freeze(thr->q);
 
@@ -1380,7 +1334,6 @@ static int opencl_autodetect()
 	}
 
 #ifdef HAVE_SENSORS
-	struct opencl_device_data *data;
 	const sensors_chip_name *cn;
 	int c = 0;
 	
@@ -1394,20 +1347,23 @@ static int opencl_autodetect()
 		struct cgpu_info *cgpu;
 
 		cgpu = &gpus[i];
-		cgpu->devtype = "GPU";
+		struct opencl_device_data * const data = cgpu->device_data;
+		
 		cgpu->deven = DEV_ENABLED;
 		cgpu->drv = &opencl_api;
 		cgpu->device_id = i;
-		cgpu->threads = opt_g_threads;
-		cgpu->virtual_gpu = i;
+		if (cgpu->threads == 0)
+			cgpu->threads = opt_g_threads;
+		data->virtual_gpu = i;
 		
 #ifdef HAVE_SENSORS
 		cn = (c == -1) ? NULL : sensors_get_detected_chips(&cnm, &c);
-		cgpu->device_data = data = malloc(sizeof(*data));
-		*data = (struct opencl_device_data){
-			.sensor = cn,
-		};
+		data->sensor = cn;
 #endif
+		
+		cgpu->set_device_funcs = opencl_set_device_funcs_probe;
+		cgpu_set_defaults(cgpu);
+		cgpu->set_device_funcs = opencl_set_device_funcs;
 		
 		add_cgpu(cgpu);
 	}
@@ -1420,20 +1376,31 @@ static int opencl_autodetect()
 
 static void opencl_detect()
 {
-	noserial_detect_manual(&opencl_api, opencl_autodetect);
+	int flags = 0;
+	if (!opt_scrypt)
+		flags |= GDF_DEFAULT_NOAUTO;
+	generic_detect(&opencl_api, NULL, opencl_autodetect, flags);
 }
 
 static void reinit_opencl_device(struct cgpu_info *gpu)
 {
+#ifdef HAVE_ADL
+	struct opencl_device_data * const data = gpu->device_data;
+	if (adl_active && data->has_adl && gpu_activity(gpu->device_id) > 50)
+	{
+		applogr(, LOG_ERR, "%s: Still showing activity (suggests a hard hang); cancelling reinitialise.",
+		        gpu->dev_repr);
+	}
+#endif
+	
 	tq_push(control_thr[gpur_thr_id].q, gpu);
 }
 
-// FIXME: Legacy (called by TUI) for side effects
 static
-bool override_opencl_statline_temp(char *buf, size_t bufsz, struct cgpu_info *gpu, __maybe_unused bool per_processor)
+bool opencl_get_stats(struct cgpu_info * const gpu)
 {
+	__maybe_unused struct opencl_device_data * const data = gpu->device_data;
 #ifdef HAVE_SENSORS
-	struct opencl_device_data *data = gpu->device_data;
 	if (data->sensor)
 	{
 		const sensors_chip_name *cn = data->sensor;
@@ -1451,23 +1418,48 @@ bool override_opencl_statline_temp(char *buf, size_t bufsz, struct cgpu_info *gp
 				continue;
 			
 			gpu->temp = val;
-			return false;
+			return true;
 		}
 	}
 #endif
 #ifdef HAVE_ADL
-	if (gpu->has_adl) {
+	if (data->has_adl) {
 		int gpuid = gpu->device_id;
 		gpu_temp(gpuid);
 		gpu_fanspeed(gpuid);
 	}
 #endif
-	return false;
+	return true;
+}
+
+static
+void opencl_watchdog(struct cgpu_info * const cgpu, __maybe_unused const struct timeval * const tv_now)
+{
+#ifdef HAVE_ADL
+	struct opencl_device_data * const data = cgpu->device_data;
+	const int gpu = cgpu->device_id;
+	enum dev_enable *denable = &cgpu->deven;
+	
+	if (adl_active && data->has_adl)
+		gpu_autotune(gpu, denable);
+	if (opt_debug && data->has_adl) {
+		int engineclock = 0, memclock = 0, activity = 0, fanspeed = 0, fanpercent = 0, powertune = 0;
+		float temp = 0, vddc = 0;
+
+		if (gpu_stats(gpu, &temp, &engineclock, &memclock, &vddc, &activity, &fanspeed, &fanpercent, &powertune))
+			applog(LOG_DEBUG, "%.1f C  F: %d%%(%dRPM)  E: %dMHz  M: %dMHz  V: %.3fV  A: %d%%  P: %d%%",
+			temp, fanpercent, fanspeed, engineclock, memclock, vddc, activity, powertune);
+	}
+#endif
 }
 
 static struct api_data*
 get_opencl_api_extra_device_status(struct cgpu_info *gpu)
 {
+	struct opencl_device_data * const data = gpu->device_data;
+	struct thr_info * const thr = gpu->thr[0];
+	const int thr_id = thr->id;
+	_clState * const clState = clStates[thr_id];
 	struct api_data*root = NULL;
 
 	float gt, gv;
@@ -1485,17 +1477,23 @@ get_opencl_api_extra_device_status(struct cgpu_info *gpu)
 	root = api_add_int(root, "Powertune", &pt, true);
 
 	char intensity[20];
-	if (gpu->dynamic)
+	uint32_t oclthreads = data->oclthreads;
+	double intensityf = oclthreads_to_intensity(oclthreads, !opt_scrypt);
+	double xintensity = oclthreads_to_xintensity(oclthreads, clState->max_compute_units);
+	if (data->dynamic)
 		strcpy(intensity, "D");
 	else
-		sprintf(intensity, "%d", gpu->intensity);
+		sprintf(intensity, "%g", intensityf);
 	root = api_add_string(root, "Intensity", intensity, true);
+	root = api_add_uint32(root, "OCLThreads", &oclthreads, true);
+	root = api_add_double(root, "CIntensity", &intensityf, true);
+	root = api_add_double(root, "XIntensity", &xintensity, true);
 
 	return root;
 }
 
 struct opencl_thread_data {
-	cl_int (*queue_kernel_parameters)(_clState *, dev_blk_ctx *, cl_uint);
+	cl_int (*queue_kernel_parameters)(_clState *, struct work *, cl_uint);
 	uint32_t *res;
 };
 
@@ -1505,8 +1503,9 @@ static bool opencl_thread_prepare(struct thr_info *thr)
 {
 	char name[256];
 	struct cgpu_info *cgpu = thr->cgpu;
+	struct opencl_device_data * const data = cgpu->device_data;
 	int gpu = cgpu->device_id;
-	int virtual_gpu = cgpu->virtual_gpu;
+	int virtual_gpu = data->virtual_gpu;
 	int i = thr->id;
 	static bool failmessage = false;
 	int buffersize = opt_scrypt ? SCRYPT_BUFFERSIZE : BUFFERSIZE;
@@ -1548,7 +1547,7 @@ static bool opencl_thread_prepare(struct thr_info *thr)
 		return false;
 	}
 	if (!cgpu->name)
-		cgpu->name = strdup(name);
+		cgpu->name = trimmed_strdup(name);
 	if (!cgpu->kname)
 	{
 		switch (clStates[i]->chosen_kernel) {
@@ -1610,6 +1609,7 @@ static bool opencl_thread_init(struct thr_info *thr)
 #ifdef USE_SCRYPT
 		case KL_SCRYPT:
 			thrdata->queue_kernel_parameters = &queue_scrypt_kernel;
+			gpu->min_nonce_diff = 1./0x10000;
 			break;
 #endif
 		default:
@@ -1644,11 +1644,12 @@ static bool opencl_thread_init(struct thr_info *thr)
 static bool opencl_prepare_work(struct thr_info __maybe_unused *thr, struct work *work)
 {
 #ifdef USE_SCRYPT
-	if (opt_scrypt)
-		work->blk.work = work;
-	else
+	if (!opt_scrypt)
 #endif
-		precalc_hash(&work->blk, (uint32_t *)(work->midstate), (uint32_t *)(work->data + 64));
+	{
+		struct opencl_work_data * const blk = _opencl_work_data(work);
+		precalc_hash(blk, (uint32_t *)(work->midstate), (uint32_t *)(work->data + 64));
+	}
 	return true;
 }
 
@@ -1660,6 +1661,7 @@ static int64_t opencl_scanhash(struct thr_info *thr, struct work *work,
 	const int thr_id = thr->id;
 	struct opencl_thread_data *thrdata = thr->cgpu_data;
 	struct cgpu_info *gpu = thr->cgpu;
+	struct opencl_device_data * const data = gpu->device_data;
 	_clState *clState = clStates[thr_id];
 	const cl_kernel *kernel = &clState->kernel;
 	const int dynamic_us = opt_dynamic_interval * 1000;
@@ -1672,28 +1674,37 @@ static int64_t opencl_scanhash(struct thr_info *thr, struct work *work,
 	int buffersize = opt_scrypt ? SCRYPT_BUFFERSIZE : BUFFERSIZE;
 
 	/* Windows' timer resolution is only 15ms so oversample 5x */
-	if (gpu->dynamic && (++gpu->intervals * dynamic_us) > 70000) {
+	if (data->dynamic && (++data->intervals * dynamic_us) > 70000) {
 		struct timeval tv_gpuend;
 		double gpu_us;
 
 		cgtime(&tv_gpuend);
-		gpu_us = us_tdiff(&tv_gpuend, &gpu->tv_gpustart) / gpu->intervals;
+		gpu_us = us_tdiff(&tv_gpuend, &data->tv_gpustart) / data->intervals;
 		if (gpu_us > dynamic_us) {
-			if (gpu->intensity > MIN_INTENSITY)
-				--gpu->intensity;
+			const unsigned long min_oclthreads = intensity_to_oclthreads(MIN_INTENSITY, !opt_scrypt);
+			data->oclthreads /= 2;
+			if (data->oclthreads < min_oclthreads)
+				data->oclthreads = min_oclthreads;
 		} else if (gpu_us < dynamic_us / 2) {
-			if (gpu->intensity < MAX_INTENSITY)
-				++gpu->intensity;
+			const unsigned long max_oclthreads = intensity_to_oclthreads(MAX_INTENSITY, !opt_scrypt);
+			data->oclthreads *= 2;
+			if (data->oclthreads > max_oclthreads)
+				data->oclthreads = max_oclthreads;
 		}
-		memcpy(&(gpu->tv_gpustart), &tv_gpuend, sizeof(struct timeval));
-		gpu->intervals = 0;
+		memcpy(&(data->tv_gpustart), &tv_gpuend, sizeof(struct timeval));
+		data->intervals = 0;
 	}
 
-	set_threads_hashes(clState->vwidth, &hashes, globalThreads, localThreads[0], &gpu->intensity);
+	if (data->oclthreads < localThreads[0])
+		data->oclthreads = localThreads[0];
+	globalThreads[0] = data->oclthreads;
+	hashes = globalThreads[0];
+	hashes *= clState->vwidth;
+	
 	if (hashes > gpu->max_hashes)
 		gpu->max_hashes = hashes;
 
-	status = thrdata->queue_kernel_parameters(clState, &work->blk, globalThreads[0]);
+	status = thrdata->queue_kernel_parameters(clState, work, globalThreads[0]);
 	if (unlikely(status != CL_SUCCESS)) {
 		applog(LOG_ERR, "Error: clSetKernelArg of all params failed.");
 		return -1;
@@ -1758,6 +1769,60 @@ static void opencl_thread_shutdown(struct thr_info *thr)
 	clReleaseContext(clState->context);
 }
 
+static
+const char *opencl_cannot_set(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	return "Cannot set at runtime (use --set-device on commandline)";
+}
+
+static const struct bfg_set_device_definition opencl_set_device_funcs_probe[] = {
+	{"intensity", opencl_init_intensity},
+	{"kernel", opencl_init_kernel},
+	{"threads", opencl_init_gpu_threads},
+	{"vector", opencl_init_vector},
+	{"work_size", opencl_init_worksize},
+#ifdef HAVE_ADL
+	{"adl_mapping", opencl_init_gpu_map},
+	{"clock", opencl_init_gpu_engine},
+	{"fan", opencl_init_gpu_fan},
+	{"memclock", opencl_init_gpu_memclock},
+	{"memdiff", opencl_init_gpu_memdiff},
+	{"powertune", opencl_init_gpu_powertune},
+	{"temp_overheat", opencl_init_temp_overheat},
+	{"voltage", opencl_init_gpu_vddc},
+#endif
+#ifdef USE_SCRYPT
+	{"shaders", opencl_init_shaders},
+	{"lookup_gap", opencl_init_lookup_gap},
+	{"thread_concurrency", opencl_init_thread_concurrency},
+#endif
+	{NULL}
+};
+
+static const struct bfg_set_device_definition opencl_set_device_funcs[] = {
+	{"intensity", opencl_init_intensity, "Intensity of GPU scanning (d, -10 -> 31, or x1 to x9999)"},
+	{"kernel", opencl_cannot_set, "Mining kernel code to use"},
+	{"threads", opencl_cannot_set, "Number of threads"},
+	{"vector", opencl_cannot_set, ""},
+	{"work_size", opencl_cannot_set, ""},
+#ifdef HAVE_ADL
+	{"adl_mapping", opencl_cannot_set, "Map to ADL device"},
+	{"clock", opencl_set_gpu_engine, "GPU engine clock"},
+	{"fan", opencl_set_gpu_fan, "GPU fan percentage range"},
+	{"memclock", opencl_set_gpu_memclock, "GPU memory clock"},
+	{"memdiff", opencl_set_gpu_memdiff, "Clock speed difference between GPU and memory (auto-gpu mode only)"},
+	{"powertune", opencl_cannot_set, "GPU powertune percentage"},
+	{"temp_overheat", opencl_init_temp_overheat, "Overheat temperature when automatically managing fan and GPU speeds"},
+	{"voltage", opencl_set_gpu_vddc, "GPU voltage"},
+#endif
+#ifdef USE_SCRYPT
+	{"shaders", opencl_cannot_set, "GPU shaders per card (scrypt only)"},
+	{"lookup_gap", opencl_cannot_set, "GPU lookup gap (scrypt only)"},
+	{"thread_concurrency", opencl_cannot_set, "GPU thread concurrency (scrypt only)"},
+#endif
+	{NULL}
+};
+
 struct device_drv opencl_api = {
 	.dname = "opencl",
 	.name = "OCL",
@@ -1765,7 +1830,8 @@ struct device_drv opencl_api = {
 	.supported_algos = POW_SHA256D | POW_SCRYPT,
 	.drv_detect = opencl_detect,
 	.reinit_device = reinit_opencl_device,
-	.override_statline_temp2 = override_opencl_statline_temp,
+	.watchdog = opencl_watchdog,
+	.get_stats = opencl_get_stats,
 #ifdef HAVE_CURSES
 	.proc_wlogprint_status = opencl_wlogprint_status,
 	.proc_tui_wlogprint_choices = opencl_tui_wlogprint_choices,

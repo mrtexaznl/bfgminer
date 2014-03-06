@@ -1,5 +1,5 @@
-#ifndef __OCL_H__
-#define __OCL_H__
+#ifndef BFG_OCL_H
+#define BFG_OCL_H
 
 #include "config.h"
 
@@ -27,6 +27,7 @@ typedef struct {
 	cl_uint vwidth;
 	size_t max_work_size;
 	size_t wsize;
+	cl_uint max_compute_units;
 	enum cl_kernels chosen_kernel;
 } _clState;
 

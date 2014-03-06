@@ -28,6 +28,7 @@
 #define HASHBUSTER_MAX_BYTES_PER_SPI_TRANSFER 61
 
 BFG_REGISTER_DRIVER(hashbusterusb_drv)
+static const struct bfg_set_device_definition hashbusterusb_set_device_funcs[];
 
 struct hashbusterusb_state {
 	uint16_t voltage;
@@ -166,17 +167,22 @@ bool hashbusterusb_lowl_probe(const struct lowlevel_device_info * const info)
 		applogr(false, LOG_ERR, "%s: Failed to open %s: %s",
 		        __func__, info->devid, bfg_strerror(j, BST_LIBUSB));
 	if ( (j = libusb_set_configuration(h, 1)) )
+	{
+		libusb_close(h);
 		applogr(false, LOG_ERR, "%s: Failed to set configuration 1 on %s: %s",
 		        __func__, info->devid, bfg_strerror(j, BST_LIBUSB));
+	}
 	if ( (j = libusb_claim_interface(h, 0)) )
+	{
+		libusb_close(h);
 		applogr(false, LOG_ERR, "%s: Failed to claim interface 0 on %s: %s",
 		        __func__, info->devid, bfg_strerror(j, BST_LIBUSB));
+	}
 	struct lowl_usb_endpoint * const ep = usb_open_ep_pair(h, 0x81, 64, 0x01, 64);
 	usb_ep_set_timeouts_ms(ep, 100, 0);
 	
-	unsigned char OUTPacket[64];
+	unsigned char OUTPacket[64] = { 0xfe };
 	unsigned char INPacket[64];
-	OUTPacket[0] = 0xFE;
 	hashbusterusb_io(ep, INPacket, OUTPacket);
 	if (INPacket[1] == 0x18)
 	{
@@ -248,6 +254,7 @@ fail:
 		cgpu = malloc(sizeof(*cgpu));
 		*cgpu = (struct cgpu_info){
 			.drv = &hashbusterusb_drv,
+			.set_device_funcs = hashbusterusb_set_device_funcs,
 			.procs = chip_n,
 			.device_data = devicelist,
 			.cutofftemp = 200,
@@ -374,11 +381,8 @@ void hashbusterusb_shutdown(struct thr_info *thr)
 	struct lowl_usb_endpoint * const h = spi->userp;
 	
 	// Shutdown PSU
-	unsigned char OUTPacket[64];
+	unsigned char OUTPacket[64] = { 0x10 };
 	unsigned char INPacket[64];
-	OUTPacket[0] = 0x10;
-	OUTPacket[1] = 0x00;
-	OUTPacket[2] = 0x00;
 	hashbusterusb_io(h, INPacket, OUTPacket);
 }
 
@@ -460,50 +464,49 @@ struct api_data *hashbusterusb_api_extra_device_stats(struct cgpu_info * const c
 }
 
 static
-char *hashbusterusb_set_device(struct cgpu_info * const proc, char * const option, char * const setting, char * const replybuf)
+const char *hashbusterusb_rpcset_vrmlock(struct cgpu_info * const proc, const char * const option, const char * const setting, char * const replybuf, enum bfg_set_device_replytype * const success)
 {
-	if (!strcasecmp(option, "help"))
-	{
-		bitfury_set_device(proc, option, setting, replybuf);
-		tailsprintf(replybuf, 1024, "\nvrmlock: Lock the VRM voltage to safe range\nvrmunlock: Allow setting potentially unsafe voltages (requires unlock code)\nvoltage: Set voltage");
-		return replybuf;
-	}
-	
-	if (!strcasecmp(option, "vrmlock"))
-	{
-		cgpu_request_control(proc->device);
-		hashbusterusb_vrm_lock(proc);
-		cgpu_release_control(proc->device);
-		return NULL;
-	}
-	
-	if (!strcasecmp(option, "vrmunlock"))
-	{
-		cgpu_request_control(proc->device);
-		const bool rv = hashbusterusb_vrm_unlock(proc, setting);
-		cgpu_release_control(proc->device);
-		if (!rv)
-			return "Unlock error";
-		return NULL;
-	}
-	
-	if (!strcasecmp(option, "voltage"))
-	{
-		const int val = atof(setting) * 1000;
-		if (val < 600 || val > 1100)
-			return "Invalid PSU voltage value";
-		
-		cgpu_request_control(proc->device);
-		const bool rv = hashbusterusb_set_voltage(proc, val);
-		cgpu_release_control(proc->device);
-		
-		if (!rv)
-			return "Voltage change error";
-		return NULL;
-	}
-	
-	return bitfury_set_device(proc, option, setting, replybuf);
+	cgpu_request_control(proc->device);
+	hashbusterusb_vrm_lock(proc);
+	cgpu_release_control(proc->device);
+	return NULL;
 }
+
+static
+const char *hashbusterusb_rpcset_vrmunlock(struct cgpu_info * const proc, const char * const option, const char * const setting, char * const replybuf, enum bfg_set_device_replytype * const success)
+{
+	cgpu_request_control(proc->device);
+	const bool rv = hashbusterusb_vrm_unlock(proc, setting);
+	cgpu_release_control(proc->device);
+	if (!rv)
+		return "Unlock error";
+	return NULL;
+}
+
+static
+const char *hashbusterusb_rpcset_voltage(struct cgpu_info * const proc, const char * const option, const char * const setting, char * const replybuf, enum bfg_set_device_replytype * const success)
+{
+	const int val = atof(setting) * 1000;
+	if (val < 600 || val > 1100)
+		return "Invalid PSU voltage value";
+	
+	cgpu_request_control(proc->device);
+	const bool rv = hashbusterusb_set_voltage(proc, val);
+	cgpu_release_control(proc->device);
+	
+	if (!rv)
+		return "Voltage change error";
+	return NULL;
+}
+
+static const struct bfg_set_device_definition hashbusterusb_set_device_funcs[] = {
+	{"baud"     , bitfury_set_baud              , "SPI baud rate"},
+	{"osc6_bits", bitfury_set_osc6_bits         , "range 1-"BITFURY_MAX_OSC6_BITS_S" (slow to fast)"},
+	{"vrmlock"  , hashbusterusb_rpcset_vrmlock  , "Lock the VRM voltage to safe range"},
+	{"vrmunlock", hashbusterusb_rpcset_vrmunlock, "Allow setting potentially unsafe voltages (requires unlock code)"},
+	{"voltage"  , hashbusterusb_rpcset_voltage  , "Set voltage"},
+	{NULL},
+};
 
 #ifdef HAVE_CURSES
 void hashbusterusb_tui_wlogprint_choices(struct cgpu_info * const proc)
@@ -598,7 +601,6 @@ struct device_drv hashbusterusb_drv = {
 	
 	.get_api_extra_device_detail = bitfury_api_device_detail,
 	.get_api_extra_device_status = hashbusterusb_api_extra_device_stats,
-	.set_device = hashbusterusb_set_device,
 	.identify_device = hashbusterusb_identify,
 	
 #ifdef HAVE_CURSES

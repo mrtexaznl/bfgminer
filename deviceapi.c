@@ -12,6 +12,7 @@
 
 #include "config.h"
 
+#include <ctype.h>
 #ifdef WIN32
 #include <winsock2.h>
 #else
@@ -273,6 +274,16 @@ disabled:
 	}
 }
 
+void mt_disable_start__async(struct thr_info * const mythr)
+{
+	mt_disable_start(mythr);
+	if (mythr->prev_work)
+		free_work(mythr->prev_work);
+	mythr->prev_work = mythr->work;
+	mythr->work = NULL;
+	mythr->_job_transition_in_progress = false;
+}
+
 bool do_job_prepare(struct thr_info *mythr, struct timeval *tvp_now)
 {
 	struct cgpu_info *proc = mythr->cgpu;
@@ -349,7 +360,7 @@ void job_results_fetched(struct thr_info *mythr)
 			
 			do_process_results(mythr, &tv_now, mythr->prev_work, true);
 		}
-		mt_disable_start(mythr);
+		mt_disable_start__async(mythr);
 	}
 }
 
@@ -558,7 +569,7 @@ disabled: ;
 							mythr->_proceed_with_new_job = false;
 					}
 					else  // !mythr->_mt_disable_called
-						mt_disable_start(mythr);
+						mt_disable_start__async(mythr);
 				}
 			}
 			
@@ -702,7 +713,7 @@ void *miner_thread(void *userdata)
 		goto out;
 	}
 
-	if (drv_ready(cgpu))
+	if (drv_ready(cgpu) && !cgpu->already_set_defaults)
 		cgpu_set_defaults(cgpu);
 	
 	thread_reportout(mythr);
@@ -770,13 +781,14 @@ bool _add_cgpu(struct cgpu_info *cgpu)
 		int ns;
 		int tpp = cgpu->threads / lpcount;
 		struct cgpu_info **nlp_p, *slave;
-		const bool manylp = (lpcount > 26);
-		const char *as = (manylp ? "aa" : "a");
+		int lpdigits = 1;
+		for (int i = lpcount; i > 26 && lpdigits < 3; i /= 26)
+			++lpdigits;
 		
-		// Note, strcpy instead of assigning a byte to get the \0 too
-		strcpy(&cgpu->proc_repr[5], as);
+		memset(&cgpu->proc_repr[5], 'a', lpdigits);
+		cgpu->proc_repr[5 + lpdigits] = '\0';
 		ns = strlen(cgpu->proc_repr_ns);
-		strcpy(&cgpu->proc_repr_ns[ns], as);
+		strcpy(&cgpu->proc_repr_ns[ns], &cgpu->proc_repr[5]);
 		
 		nlp_p = &cgpu->next_proc;
 		for (int i = 1; i < lpcount; ++i)
@@ -784,17 +796,10 @@ bool _add_cgpu(struct cgpu_info *cgpu)
 			slave = malloc(sizeof(*slave));
 			*slave = *cgpu;
 			slave->proc_id = i;
-			if (manylp)
+			for (int x = i, y = lpdigits; --y, x; x /= 26)
 			{
-				slave->proc_repr[5] += i / 26;
-				slave->proc_repr[6] += i % 26;
-				slave->proc_repr_ns[ns    ] += i / 26;
-				slave->proc_repr_ns[ns + 1] += i % 26;
-			}
-			else
-			{
-				slave->proc_repr[5] += i;
-				slave->proc_repr_ns[ns] += i;
+				slave->proc_repr_ns[ns + y] =
+				slave->proc_repr[5 + y] += (x % 26);
 			}
 			slave->threads = tpp;
 			devices_new[total_devices_new++] = slave;
@@ -845,6 +850,126 @@ bool add_cgpu_slave(struct cgpu_info *cgpu, struct cgpu_info *prev_cgpu)
 	mutex_unlock(&_add_cgpu_mutex);
 	
 	return true;
+}
+
+const char *proc_set_device_help(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	const struct bfg_set_device_definition *sdf;
+	char *p = replybuf;
+	bool first = true;
+	
+	*out_success = SDR_HELP;
+	sdf = proc->set_device_funcs;
+	if (!sdf)
+nohelp:
+		return "No help available";
+	
+	size_t matchlen = 0;
+	if (newvalue)
+		while (!isspace(newvalue[0]))
+			++matchlen;
+	
+	for ( ; sdf->optname; ++sdf)
+	{
+		if (!sdf->description)
+			continue;
+		if (matchlen && (strncasecmp(optname, sdf->optname, matchlen) || optname[matchlen]))
+			continue;
+		if (first)
+			first = false;
+		else
+			p++[0] = '\n';
+		p += sprintf(p, "%s: %s", sdf->optname, sdf->description);
+	}
+	if (replybuf == p)
+		goto nohelp;
+	return replybuf;
+}
+
+const char *proc_set_device_temp_cutoff(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	int target_diff = proc->cutofftemp - proc->targettemp;
+	proc->cutofftemp = atoi(newvalue);
+	if (!proc->targettemp_user)
+		proc->targettemp = proc->cutofftemp - target_diff;
+	return NULL;
+}
+
+const char *proc_set_device_temp_target(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	proc->targettemp = atoi(newvalue);
+	proc->targettemp_user = true;
+	return NULL;
+}
+
+static inline
+void _set_auto_sdr(enum bfg_set_device_replytype * const out_success, const char * const rv, const char * const optname)
+{
+	if (!rv)
+		*out_success = SDR_OK;
+	else
+	if (!strcasecmp(optname, "help"))
+		*out_success = SDR_HELP;
+	else
+		*out_success = SDR_ERR;
+}
+
+const char *_proc_set_device(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	const struct bfg_set_device_definition *sdf;
+	
+	sdf = proc->set_device_funcs;
+	if (!sdf)
+	{
+		*out_success = SDR_NOSUPP;
+		return "Device does not support setting parameters.";
+	}
+	for ( ; sdf->optname; ++sdf)
+		if (!strcasecmp(optname, sdf->optname))
+		{
+			*out_success = SDR_AUTO;
+			const char * const rv = sdf->func(proc, optname, newvalue, replybuf, out_success);
+			if (SDR_AUTO == *out_success)
+				_set_auto_sdr(out_success, rv, optname);
+			return rv;
+		}
+	
+	if (!strcasecmp(optname, "help"))
+		return proc_set_device_help(proc, optname, newvalue, replybuf, out_success);
+	
+	*out_success = SDR_UNKNOWN;
+	sprintf(replybuf, "Unknown option: %s", optname);
+	return replybuf;
+}
+
+const char *__proc_set_device(struct cgpu_info * const proc, char * const optname, char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	if (proc->drv->set_device)
+	{
+		const char * const rv = proc->drv->set_device(proc, optname, newvalue, replybuf);
+		_set_auto_sdr(out_success, rv, optname);
+		return rv;
+	}
+	
+	return _proc_set_device(proc, optname, newvalue, replybuf, out_success);
+}
+
+const char *proc_set_device(struct cgpu_info * const proc, char * const optname, char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	const char * const rv = __proc_set_device(proc, optname, newvalue, replybuf, out_success);
+	switch (*out_success)
+	{
+		case SDR_NOSUPP:
+		case SDR_UNKNOWN:
+			if (!strcasecmp(optname, "temp-cutoff") || !strcasecmp(optname, "temp_cutoff"))
+				return proc_set_device_temp_cutoff(proc, optname, newvalue, replybuf, out_success);
+			else
+			if (!strcasecmp(optname, "temp-target") || !strcasecmp(optname, "temp_target"))
+				return proc_set_device_temp_target(proc, optname, newvalue, replybuf, out_success);
+		default:
+			break;
+	}
+	return rv;
 }
 
 #ifdef NEED_BFG_LOWL_VCOM

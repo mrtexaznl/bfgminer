@@ -11,8 +11,8 @@
  * any later version.  See COPYING for more details.
  */
 
-#ifndef __MINER_H__
-#define __MINER_H__
+#ifndef BFG_MINER_H
+#define BFG_MINER_H
 
 #include "config.h"
 
@@ -41,10 +41,6 @@
 
 #include "logging.h"
 #include "util.h"
-
-#ifdef HAVE_OPENCL
-#include "CL/cl.h"
-#endif /* HAVE_OPENCL */
 
 #ifdef STDC_HEADERS
 # include <stdlib.h>
@@ -304,6 +300,7 @@ struct device_drv {
 	bool (*lowl_probe)(const struct lowlevel_device_info *);
 
 	// Processor-specific functions
+	void (*watchdog)(struct cgpu_info *, const struct timeval *tv_now);
 	void (*reinit_device)(struct cgpu_info *);
 	bool (*override_statline_temp2)(char *buf, size_t bufsz, struct cgpu_info *, bool per_processor);
 	struct api_data* (*get_api_extra_device_detail)(struct cgpu_info *);
@@ -446,7 +443,7 @@ struct cgpu_info {
 	int cgminer_id;
 	int device_line_id;
 	struct device_drv *drv;
-	const char *devtype;
+	const struct bfg_set_device_definition *set_device_funcs;
 	int device_id;
 	char *dev_repr;
 	char *dev_repr_ns;
@@ -454,8 +451,8 @@ struct cgpu_info {
 	
 	int procs;
 	int proc_id;
-	char proc_repr[8];
-	char proc_repr_ns[8];
+	char proc_repr[9];
+	char proc_repr_ns[9];
 	struct cgpu_info *device;
 	struct cgpu_info *next_proc;
 	
@@ -499,7 +496,7 @@ struct cgpu_info {
 	int accepted;
 	int rejected;
 	int stale;
-	int bad_nonces;
+	double bad_diff1;
 	int hw_errors;
 	double rolling;
 	double total_mhashes;
@@ -515,47 +512,13 @@ struct cgpu_info {
 	int64_t max_hashes;
 
 	const char *kname;
-#ifdef HAVE_OPENCL
-	bool mapped;
-	int virtual_gpu;
-	int virtual_adl;
-	int intensity;
-	bool dynamic;
-
-	cl_uint vwidth;
-	size_t work_size;
-	enum cl_kernels kernel;
-	cl_ulong max_alloc;
-
-#ifdef USE_SCRYPT
-	int opt_lg, lookup_gap;
-	size_t opt_tc, thread_concurrency;
-	size_t shaders;
-#endif
-	struct timeval tv_gpustart;
-	int intervals;
-#endif
 
 	float temp;
 	int cutofftemp;
-	uint8_t cutofftemp_default;
 	int targettemp;
-	uint8_t targettemp_default;
+	bool targettemp_user;
 
-#ifdef HAVE_ADL
-	bool has_adl;
-	struct gpu_adl adl;
-
-	int gpu_engine;
-	int min_engine;
-	int gpu_fan;
-	int min_fan;
-	int gpu_memclock;
-	int gpu_memdiff;
-	int gpu_powertune;
-	float gpu_vddc;
-#endif
-	int diff1;
+	double diff1;
 	double diff_accepted;
 	double diff_rejected;
 	double diff_stale;
@@ -589,6 +552,9 @@ struct cgpu_info {
 
 	bool disable_watchdog;
 	bool shutdown;
+	
+	// Lowest difficulty supported for finding nonces
+	float min_nonce_diff;
 };
 
 extern void renumber_cgpu(struct cgpu_info *);
@@ -957,6 +923,7 @@ extern int opt_api_port;
 extern bool opt_api_listen;
 extern bool opt_api_network;
 extern bool opt_delaynet;
+extern time_t last_getwork;
 extern bool opt_restart;
 extern char *opt_icarus_options;
 extern char *opt_icarus_timing;
@@ -1041,7 +1008,7 @@ extern void proc_enable(struct cgpu_info *);
 extern void reinit_device(struct cgpu_info *cgpu);
 
 extern void cgpu_set_defaults(struct cgpu_info *);
-extern void drv_set_defaults(const struct device_drv *, char *(*set_func)(struct cgpu_info *, char *, char *, char *), void *userp);
+extern void drv_set_defaults(const struct device_drv *, const void *, void *userp, const char *devpath, const char *serial, int mode);
 
 #ifdef HAVE_ADL
 extern bool gpu_stats(int gpu, float *temp, int *engineclock, int *memclock, float *vddc, int *activity, int *fanspeed, int *fanpercent, int *powertune);
@@ -1071,8 +1038,8 @@ extern bool add_pool_details(struct pool *pool, bool live, char *url, char *user
 #define MAX_SHA_INTENSITY_STR "14"
 #define MIN_SCRYPT_INTENSITY 8
 #define MIN_SCRYPT_INTENSITY_STR "8"
-#define MAX_SCRYPT_INTENSITY 20
-#define MAX_SCRYPT_INTENSITY_STR "20"
+#define MAX_SCRYPT_INTENSITY 31
+#define MAX_SCRYPT_INTENSITY_STR "31"
 #ifdef USE_SCRYPT
 #define MIN_INTENSITY (opt_scrypt ? MIN_SCRYPT_INTENSITY : MIN_SHA_INTENSITY)
 #define MIN_INTENSITY_STR (opt_scrypt ? MIN_SCRYPT_INTENSITY_STR : MIN_SHA_INTENSITY_STR)
@@ -1121,11 +1088,11 @@ extern double total_rolling;
 extern double total_mhashes_done;
 extern unsigned int new_blocks;
 extern unsigned int found_blocks;
-extern int total_accepted, total_rejected, total_diff1;;
-extern int total_bad_nonces;
+extern int total_accepted, total_rejected;
 extern int total_getworks, total_stale, total_discarded;
 extern uint64_t total_bytes_rcvd, total_bytes_sent;
 #define total_bytes_xfer (total_bytes_rcvd + total_bytes_sent)
+extern double total_diff1, total_bad_diff1;
 extern double total_diff_accepted, total_diff_rejected, total_diff_stale;
 extern unsigned int local_work;
 extern unsigned int total_go, total_ro;
@@ -1138,40 +1105,6 @@ extern char *current_fullhash;
 extern double current_diff;
 extern uint64_t best_diff;
 extern time_t block_time;
-
-#ifdef HAVE_OPENCL
-typedef struct {
-	cl_uint ctx_a; cl_uint ctx_b; cl_uint ctx_c; cl_uint ctx_d;
-	cl_uint ctx_e; cl_uint ctx_f; cl_uint ctx_g; cl_uint ctx_h;
-	cl_uint cty_a; cl_uint cty_b; cl_uint cty_c; cl_uint cty_d;
-	cl_uint cty_e; cl_uint cty_f; cl_uint cty_g; cl_uint cty_h;
-	cl_uint merkle; cl_uint ntime; cl_uint nbits; cl_uint nonce;
-	cl_uint fW0; cl_uint fW1; cl_uint fW2; cl_uint fW3; cl_uint fW15;
-	cl_uint fW01r; cl_uint fcty_e; cl_uint fcty_e2;
-	cl_uint W16; cl_uint W17; cl_uint W2;
-	cl_uint PreVal4; cl_uint T1;
-	cl_uint C1addK5; cl_uint D1A; cl_uint W2A; cl_uint W17_2;
-	cl_uint PreVal4addT1; cl_uint T1substate0;
-	cl_uint PreVal4_2;
-	cl_uint PreVal0;
-	cl_uint PreW18;
-	cl_uint PreW19;
-	cl_uint PreW31;
-	cl_uint PreW32;
-
-	/* For diakgcn */
-	cl_uint B1addK6, PreVal0addK7, W16addK16, W17addK17;
-	cl_uint zeroA, zeroB;
-	cl_uint oneA, twoA, threeA, fourA, fiveA, sixA, sevenA;
-#ifdef USE_SCRYPT
-	struct work *work;
-#endif
-} dev_blk_ctx;
-#else
-typedef struct {
-	uint32_t nonce;
-} dev_blk_ctx;
-#endif
 
 struct curl_ent {
 	CURL *curl;
@@ -1227,7 +1160,7 @@ struct pool {
 	int seq_rejects;
 	int seq_getfails;
 	int solved;
-	int diff1;
+	double diff1;
 	char diff[8];
 	int quota;
 	int quota_gcd;
@@ -1344,9 +1277,10 @@ struct work {
 
 	int		rolls;
 	int		drv_rolllimit; /* How much the driver can roll ntime */
-
-
-	dev_blk_ctx	blk;
+ 
+	struct {
+		uint32_t nonce;
+	} blk;
 
 	struct thr_info	*thr;
 	int		thr_id;
@@ -1373,11 +1307,17 @@ struct work {
 	int		device_id;
 	UT_hash_handle hh;
 	
+	// Please don't use this if it's at all possible, I'd like to get rid of it eventually.
+	void *device_data;
+	void *(*device_data_dup_func)(struct work *);
+	void (*device_data_free_func)(struct work *);
+	
 	double		work_difficulty;
+	float		nonce_diff;
 
 	// Allow devices to identify work if multiple sub-devices
 	// DEPRECATED: New code should be using multiple processors instead
-	unsigned char	subid;
+	int		subid;
 	
 	// Allow devices to timestamp work for their own purposes
 	struct timeval	tv_stamp;
@@ -1411,9 +1351,18 @@ extern void get_datestamp(char *, size_t, time_t);
 extern void stratum_work_cpy(struct stratum_work *dst, const struct stratum_work *src);
 extern void stratum_work_clean(struct stratum_work *);
 extern void gen_stratum_work2(struct work *, struct stratum_work *, const char *nonce1);
-extern void inc_hw_errors2(struct thr_info *thr, const struct work *work, const uint32_t *bad_nonce_p);
+extern void inc_hw_errors3(struct thr_info *thr, const struct work *work, const uint32_t *bad_nonce_p, float nonce_diff);
+static inline
+void inc_hw_errors2(struct thr_info * const thr, const struct work * const work, const uint32_t *bad_nonce_p)
+{
+	inc_hw_errors3(thr, work, bad_nonce_p, work ? work->nonce_diff : 1.);
+}
 #define UNKNOWN_NONCE ((uint32_t*)inc_hw_errors2)
-extern void inc_hw_errors(struct thr_info *, const struct work *, const uint32_t bad_nonce);
+static inline
+void inc_hw_errors(struct thr_info * const thr, const struct work * const work, const uint32_t bad_nonce)
+{
+	inc_hw_errors2(thr, work, work ? &bad_nonce : NULL);
+}
 #define inc_hw_errors_only(thr)  inc_hw_errors(thr, NULL, 0)
 enum test_nonce2_result {
 	TNR_GOOD = 1,

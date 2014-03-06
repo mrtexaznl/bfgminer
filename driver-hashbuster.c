@@ -187,8 +187,11 @@ bool hashbuster_lowl_probe(const struct lowlevel_device_info * const info)
 		       __func__, path);
 	
 	if ((!hashbuster_io(h, buf, buf)) || buf[1] != 0x07)
+	{
+		hid_close(h);
 		applogr(false, LOG_DEBUG, "%s: Identify sequence didn't match on %s",
 		        __func__, path);
+	}
 		
 	const int chip_n = hashbuster_chip_count(h);
 	
@@ -201,6 +204,7 @@ bool hashbuster_lowl_probe(const struct lowlevel_device_info * const info)
 	cgpu = malloc(sizeof(*cgpu));
 	*cgpu = (struct cgpu_info){
 		.drv = &hashbuster_drv,
+		.set_device_funcs = bitfury_set_device_funcs,
 		.device_data = lowlevel_ref(info),
 		.threads = 1,
 		.procs = chip_n,
@@ -226,7 +230,10 @@ bool hashbuster_init(struct thr_info * const thr)
 	lowlevel_devinfo_free(cgpu->device_data);
 	
 	if (!h)
+	{
+		hid_close(h);
 		applogr(false, LOG_ERR, "%s: Failed to open hid device", cgpu->dev_repr);
+	}
 	
 	port = malloc(sizeof(*port));
 	if (!port)
@@ -311,7 +318,6 @@ struct device_drv hashbuster_drv = {
 	
 	.get_api_extra_device_detail = bitfury_api_device_detail,
 	.get_api_extra_device_status = bitfury_api_device_status,
-	.set_device = bitfury_set_device,
 	
 #ifdef HAVE_CURSES
 	.proc_wlogprint_status = bitfury_wlogprint_status,

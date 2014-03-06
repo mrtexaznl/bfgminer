@@ -13,7 +13,7 @@ dnl * any later version.  See COPYING for more details.
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_maj], [3])
-m4_define([v_min], [9])
+m4_define([v_min], [10])
 m4_define([v_mic], [0])
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_ver], [v_maj.v_min.v_mic])
@@ -80,11 +80,11 @@ dnl Checks for header files.
 AC_HEADER_STDC
 AC_CHECK_HEADERS(syslog.h)
 AC_CHECK_HEADERS([sys/epoll.h])
+AC_CHECK_HEADERS([sys/mman.h])
 AC_CHECK_HEADERS([sys/prctl.h])
 AC_CHECK_HEADERS([sys/file.h])
+AC_CHECK_HEADERS([sys/termios.h])
 AC_CHECK_HEADERS([linux/spi/spidev.h])
-
-AC_CHECK_HEADERS([sys/file.h])
 
 AC_CHECK_MEMBER([struct i2c_msg.buf],[
 	true
@@ -114,6 +114,7 @@ AC_CHECK_FUNCS([sleep])
 
 AC_FUNC_ALLOCA
 
+lowllist=
 driverlist=
 algolist=SHA256d
 optlist=
@@ -125,6 +126,7 @@ need_dynclock=no
 need_lowl_vcom=no
 need_lowlevel=no
 need_lowl_hid=no
+need_lowl_pci=no
 need_lowl_usb=no
 have_cygwin=false
 have_win32=false
@@ -217,6 +219,36 @@ AC_CHECK_DECL([HASH_ITER],[
 ],[
 	#include <uthash.h>
 ])
+
+
+lowl_pci=no
+if test "x$ac_cv_header_sys_mman_h" = "xyes"; then
+	AC_ARG_WITH([uio],
+		[AC_HELP_STRING([--without-uio],[Compile support for PCI devices via Linux UIO interface (default enabled)])],
+		[uio=$withval],
+		[uio=yes])
+	AC_ARG_WITH([vfio],
+		[AC_HELP_STRING([--without-vfio],[Compile support for PCI devices via Linux VFIO interface (default enabled)])],
+		[vfio=$enableval],
+		[vfio=auto])
+	if test "x$vfio" != "xno"; then
+		AC_CHECK_HEADER([linux/vfio.h],[
+			vfio=yes
+		],[
+			if test "x$vfio" = "xyes"; then
+				AC_MSG_ERROR([Unable to find linux/vfio.h])
+			elif test "x$uio" = "xyes"; then
+				AC_MSG_WARN([linux/vfio.h not found; PCI device support will require UIO (and root access)])
+			else
+				AC_MSG_WARN([linux/vfio.h not found; PCI device support will not be available])
+			fi
+			vfio=no
+		])
+	fi
+	if test "x$vfio$uio" != xnono; then
+		lowl_pci=yes
+	fi
+fi
 
 
 driverlist="$driverlist cpu/cpumining"
@@ -372,6 +404,10 @@ AC_ARG_ENABLE([bitforce],
 	)
 if test "x$bitforce" = xyes; then
 	AC_DEFINE([USE_BITFORCE], [1], [Defined to 1 if BitForce support is wanted])
+	driverlist="$driverlist bitforce:uio/ac_cv_header_sys_mman_h"
+	if test "x$lowl_pci" = "xyes"; then
+		need_lowl_pci=yes
+	fi
 	need_lowl_vcom=yes
 	has_fpga=yes
 	has_asic=yes
@@ -379,7 +415,7 @@ if test "x$bitforce" = xyes; then
 fi
 AM_CONDITIONAL([HAS_BITFORCE], [test x$bitforce = xyes])
 
-driverlist="$driverlist icarus cairnsmore/icarus erupter/icarus"
+driverlist="$driverlist icarus cairnsmore/icarus erupter/icarus antminer/icarus"
 AC_ARG_ENABLE([icarus],
 	[AC_HELP_STRING([--disable-icarus],[Compile support for Icarus (default enabled)])],
 	[icarus=$enableval],
@@ -548,7 +584,7 @@ PKG_CHECK_MODULES([LIBUSB], [libusb-1.0],[
 ])
 fi
 
-driverlist="$driverlist klondike"
+driverlist="$driverlist klondike hashbusteravalon/klondike"
 AC_ARG_ENABLE([klondike],
 	[AC_HELP_STRING([--disable-klondike],[Compile support for Klondike (default enabled)])],
 	[klondike=$enableval],
@@ -693,6 +729,31 @@ if test "x$bigpic" = "xyes"; then
 	have_udevrules=true
 fi
 AM_CONDITIONAL([HAS_BIGPIC], [test x$bigpic = xyes])
+
+
+driverlist="$driverlist drillbit"
+AC_ARG_ENABLE([drillbit],
+	[AC_HELP_STRING([--disable-drillbit],[Compile support for DrillBit (default enabled)])],
+	[drillbit=$enableval],
+	[drillbit=auto]
+	)
+if test "x$drillbit" = "xno"; then
+	true
+elif test "x$bitfury" = "xyes"; then
+	drillbit=yes
+elif test "x$drillbit" = "xyes"; then
+	AC_MSG_ERROR([You explicitly disabled Bitfury and explicitly enabled DrillBit])
+else
+	drillbit=no
+fi
+if test "x$drillbit" = "xyes"; then
+	AC_DEFINE([USE_DRILLBIT], [1], [Defined to 1 if DrillBit support is wanted])
+	need_lowl_vcom=yes
+	has_asic=yes
+	have_udevrules=true
+fi
+AM_CONDITIONAL([USE_DRILLBIT], [test x$drillbit = xyes])
+
 
 driverlist="$driverlist twinfury"
 twinfury=auto
@@ -844,6 +905,21 @@ fi
 AM_CONDITIONAL([USE_HASHBUSTERUSB], [test x$hashbusterusb = xyes])
 
 
+driverlist="$driverlist hashfast"
+hashfast=yes
+AC_ARG_ENABLE([hashfast],
+	[AC_HELP_STRING([--disable-hashfast],[Compile support for HashFast (default enabled)])],
+	[hashfast=$enableval]
+)
+if test "x$hashfast" = xyes; then
+	AC_DEFINE([USE_HASHFAST], [1], [Defined to 1 if HashFast support is wanted])
+	need_lowl_vcom=yes
+	has_asic=yes
+	have_udevrules=true
+fi
+AM_CONDITIONAL([USE_HASHFAST], [test x$hashfast = xyes])
+
+
 driverlist="$driverlist metabank"
 metabank=no
 AC_ARG_ENABLE([metabank],
@@ -861,7 +937,11 @@ AM_CONDITIONAL([HAS_METABANK], [test x$metabank = xyes])
 
 if test "x$need_lowl_vcom" != "xno"; then
 	# Lowlevel VCOM doesn't need libusb, but it can take advantage of it to reattach drivers
-	need_lowl_usb=yes
+	if test "x$libusb" != xno; then
+		need_lowl_usb=yes
+	elif test "x$libusb$want_libusb" = xnoyes; then
+		AC_MSG_ERROR([Could not find libusb, which you specifically requested])
+	fi
 fi
 
 if test "x$need_lowl_usb" = "xno"; then
@@ -936,15 +1016,32 @@ if test "x$opencl$need_lowl_hid" = xnono; then
 	DLOPEN_FLAGS=""
 fi
 
+lowllist="$lowllist hid/need_lowl_hid"
 if test x$need_lowl_hid = xyes; then
 	AC_DEFINE([NEED_BFG_LOWL_HID], [1], [Defined to 1 if lowlevel hid drivers are being used])
 	need_lowlevel=yes
 fi
 
+lowllist="$lowllist pci/need_lowl_pci"
+if test x$need_lowl_pci = xyes; then
+	AC_DEFINE([NEED_BFG_LOWL_PCI], [1], [Defined to 1 if lowlevel PCI drivers are being used])
+	need_lowlevel=yes
+	lowllist="$lowllist pci:uio/uio"
+	if test x$uio = xyes; then
+		AC_DEFINE([USE_UIO], [1], [Defined to 1 if lowlevel PCI drivers should support UIO])
+	fi
+	lowllist="$lowllist pci:vfio/vfio"
+	if test x$vfio = xyes; then
+		AC_DEFINE([USE_VFIO], [1], [Defined to 1 if lowlevel PCI drivers should support VFIO])
+	fi
+fi
+
+lowllist="$lowllist usb/need_lowl_usb"
 if test x$need_lowl_usb = xyes; then
 	need_lowlevel=yes
 fi
 
+lowllist="$lowllist vcom/need_lowl_vcom"
 if test x$need_lowl_vcom = xyes; then
 	need_lowlevel=yes
 fi
@@ -1129,6 +1226,7 @@ AM_CONDITIONAL([NEED_BFG_BINLOADER], [test x$need_binloader = xyes])
 AM_CONDITIONAL([NEED_DYNCLOCK], [test x$need_dynclock = xyes])
 AM_CONDITIONAL([NEED_BFG_LOWL_VCOM], [test x$need_lowl_vcom = xyes])
 AM_CONDITIONAL([NEED_BFG_LOWL_HID], [test x$need_lowl_hid = xyes])
+AM_CONDITIONAL([NEED_BFG_LOWL_PCI], [test x$need_lowl_pci = xyes])
 AM_CONDITIONAL([NEED_BFG_LOWLEVEL], [test x$need_lowlevel = xyes])
 AM_CONDITIONAL([HAS_SCRYPT], [test x$scrypt = xyes])
 AM_CONDITIONAL([HAVE_CURSES], [test x$curses = xyes])
@@ -1388,6 +1486,18 @@ if test "x$found_endian" = "xno"; then
 fi
 
 
+AC_MSG_CHECKING([if good static asserts compile])
+AC_TRY_LINK([
+], [
+	_Static_assert(1, ":)");
+], [
+	AC_MSG_RESULT([yes])
+], [
+	AC_MSG_RESULT([no])
+	AC_DEFINE_UNQUOTED([_Static_assert(...)], [], [Turns _Static_assert into noop for compilers that don't support it])
+])
+
+
 AC_MSG_CHECKING([if GNU format attribute compiles])
 AC_TRY_COMPILE([
 	#define FORMAT_SYNTAX_CHECK(...) __attribute__(( format(__VA_ARGS__) ))
@@ -1442,6 +1552,12 @@ AC_TRY_COMPILE([
 ])
 
 
+save_LIBS="$LIBS"
+LIBS="$LIBS $MATH_LIBS"
+AC_CHECK_FUNCS([log2])
+LIBS="$save_LIBS"
+
+
 if test "x$prefix" = xNONE; then
 	prefix=/usr/local
 fi
@@ -1481,6 +1597,7 @@ EOF
 	AC_DEFINE_UNQUOTED(AS_TR_CPP([BFG_$2]),["$_yeslist"],[List of drivers being built])
 	$2_print="  Enabled..$1..:${_yeslist}~  Disabled.$1..:${_nolist}${_enableactions}"
 ])
+BFG_PRINT_LIST([Lowlevel..],[lowllist])
 BFG_PRINT_LIST([Drivers...],[driverlist])
 BFG_PRINT_LIST([Algorithms],[algolist])
 BFG_PRINT_LIST([Options...],[optlist])
@@ -1506,7 +1623,7 @@ AC_CONFIG_FILES([
 	Makefile
 	x86_64/Makefile
 	x86_32/Makefile
-	ccan/Makefile
+	ccan.bfg/Makefile
 	lib/Makefile
 	])
 
@@ -1531,6 +1648,7 @@ echo "  CFLAGS...............: "`wordfilter "$CPPFLAGS $AUTOSCAN_CPPFLAGS $NCURS
 echo "  LDFLAGS..............: "`wordfilter "$LDFLAGS $AUTOSCAN_LIBS $PTHREAD_FLAGS $libblkmaker_LDFLAGS $PTHREAD_LIBS $LIBS $DLOPEN_FLAGS $LIBCURL_LIBS $JANSSON_LIBS $NCURSES_LIBS $PDCURSES_LIBS $WS2_LIBS $MATH_LIBS $UDEV_LIBS $LIBUSB_LIBS $RT_LIBS $sensors_LIBS $libblkmaker_LIBS"`
 echo "  Installation.prefix..: $prefix"
 echo
+echo "${lowllist_print}" | tr '~' '\n'
 echo "${driverlist_print}" | tr '~' '\n'
 echo "${algolist_print}" | tr '~' '\n'
 echo "${optlist_print}" | tr '~' '\n'

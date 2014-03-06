@@ -10,8 +10,8 @@
  * any later version.  See COPYING for more details.
  */
 
-#ifndef __DEVICE_CPU_H__
-#define __DEVICE_CPU_H__
+#ifndef BFG_DRIVER_CPU_H
+#define BFG_DRIVER_CPU_H
 
 #include "miner.h"
 
@@ -67,7 +67,6 @@ enum sha256_algos {
 };
 
 extern const char *algo_names[];
-extern bool opt_usecpu;
 extern struct device_drv cpu_drv;
 
 extern char *set_algo(const char *arg, enum sha256_algos *algo);

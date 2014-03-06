@@ -65,17 +65,15 @@
 // The serial I/O speed - Linux uses a define 'B115200' in bits/termios.h
 #define ICARUS_IO_SPEED 115200
 
-// The size of a successful nonce read
-#define ICARUS_READ_SIZE 4
+// The number of bytes in a nonce (always 4)
+// This is NOT the read-size for the Icarus driver
+// That is defined in ICARUS_INFO->read_size
+#define ICARUS_NONCE_SIZE 4
 
-// Ensure the sizes are correct for the Serial read
-#if (ICARUS_READ_SIZE != 4)
-#error ICARUS_READ_SIZE must be 4
-#endif
 #define ASSERT1(condition) __maybe_unused static char sizeof_uint32_t_must_be_4[(condition)?1:-1]
 ASSERT1(sizeof(uint32_t) == 4);
 
-#define ICARUS_READ_TIME(baud) ((double)ICARUS_READ_SIZE * (double)8.0 / (double)(baud))
+#define ICARUS_READ_TIME(baud, read_size) ((double)read_size * (double)8.0 / (double)(baud))
 
 // Defined in deciseconds
 // There's no need to have this bigger, since the overhead/latency of extra work
@@ -148,24 +146,8 @@ static const char *MODE_UNKNOWN_STR = "unknown";
 #define END_CONDITION 0x0000ffff
 #define DEFAULT_DETECT_THRESHOLD 1
 
-// Looking for options in --icarus-timing and --icarus-options:
-//
-// Code increments this each time we start to look at a device
-// However, this means that if other devices are checked by
-// the Icarus code (e.g. BFL) they will count in the option offset
-//
-// This, however, is deterministic so that's OK
-//
-// If we were to increment after successfully finding an Icarus
-// that would be random since an Icarus may fail and thus we'd
-// not be able to predict the option order
-//
-// This also assumes that serial_detect() checks them sequentially
-// and in the order specified on the command line
-//
-static int option_offset = -1;
-
 BFG_REGISTER_DRIVER(icarus_drv)
+extern const struct bfg_set_device_definition icarus_set_device_funcs[];
 
 extern void convert_icarus_to_cairnsmore(struct cgpu_info *);
 
@@ -184,18 +166,13 @@ static void rev(unsigned char *s, size_t l)
 #define icarus_open2(devpath, baud, purge)  serial_open(devpath, baud, ICARUS_READ_FAULT_DECISECONDS, purge)
 #define icarus_open(devpath, baud)  icarus_open2(devpath, baud, false)
 
-#define ICA_GETS_ERROR -1
-#define ICA_GETS_OK 0
-#define ICA_GETS_RESTART 1
-#define ICA_GETS_TIMEOUT 2
-
-int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct thr_info *thr, int read_count)
+int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct thr_info *thr, int read_count, int read_size)
 {
 	ssize_t ret = 0;
 	int rc = 0;
 	int epollfd = -1;
 	int epoll_timeout = ICARUS_READ_FAULT_DECISECONDS * 100;
-	int read_amount = ICARUS_READ_SIZE;
+	int read_amount = read_size;
 	bool first = true;
 
 #ifdef HAVE_EPOLL
@@ -214,7 +191,7 @@ int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct th
 		{
 			ev.data.fd = thr->work_restart_notifier[0];
 			if (-1 == epoll_ctl(epollfd, EPOLL_CTL_ADD, thr->work_restart_notifier[0], &ev))
-				applog(LOG_ERR, "Icarus: Error adding work restart fd to epoll");
+				applog(LOG_ERR, "%s: Error adding work restart fd to epoll", __func__);
 			else
 			{
 				epoll_timeout *= read_count;
@@ -223,7 +200,7 @@ int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct th
 		}
 	}
 	else
-		applog(LOG_ERR, "Icarus: Error creating epoll");
+		applog(LOG_ERR, "%s: Error creating epoll", __func__);
 	}
 #endif
 
@@ -267,7 +244,7 @@ int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct th
 		if (thr && thr->work_restart) {
 			if (epollfd != -1)
 				close(epollfd);
-			applog(LOG_DEBUG, "Icarus Read: Interrupted by work restart");
+			applog(LOG_DEBUG, "%s: Interrupted by work restart", __func__);
 			return ICA_GETS_RESTART;
 		}
 
@@ -275,14 +252,15 @@ int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct th
 		if (rc >= read_count) {
 			if (epollfd != -1)
 				close(epollfd);
-			applog(LOG_DEBUG, "Icarus Read: No data in %.2f seconds",
+			applog(LOG_DEBUG, "%s: No data in %.2f seconds",
+			       __func__,
 			       (float)rc * epoll_timeout / 1000.);
 			return ICA_GETS_TIMEOUT;
 		}
 	}
 }
 
-static int icarus_write(int fd, const void *buf, size_t bufLen)
+int icarus_write(int fd, const void *buf, size_t bufLen)
 {
 	size_t ret;
 
@@ -324,44 +302,17 @@ static const char *timing_mode_str(enum timing_mode timing_mode)
 	}
 }
 
-static void set_timing_mode(int this_option_offset, struct cgpu_info *icarus)
+static
+const char *icarus_set_timing(struct cgpu_info * const proc, const char * const optname, const char * const buf, char * const replybuf, enum bfg_set_device_replytype * const out_success)
 {
-	struct ICARUS_INFO *info = icarus->device_data;
+	struct ICARUS_INFO * const info = proc->device_data;
 	double Hs;
-	char buf[BUFSIZ+1];
-	char *ptr, *comma, *eq;
-	size_t max;
-	int i;
-
-	if (opt_icarus_timing == NULL)
-		buf[0] = '\0';
-	else {
-		ptr = opt_icarus_timing;
-		for (i = 0; i < this_option_offset; i++) {
-			comma = strchr(ptr, ',');
-			if (comma == NULL)
-				break;
-			ptr = comma + 1;
-		}
-
-		comma = strchr(ptr, ',');
-		if (comma == NULL)
-			max = strlen(ptr);
-		else
-			max = comma - ptr;
-
-		if (max > BUFSIZ)
-			max = BUFSIZ;
-		strncpy(buf, ptr, max);
-		buf[max] = '\0';
-	}
-
-	info->read_count = 0;
-	info->read_count_limit = 0; // 0 = no limit
+	char *eq;
 
 	if (strcasecmp(buf, MODE_SHORT_STR) == 0) {
 		// short
 		info->read_count = ICARUS_READ_COUNT_TIMING;
+		info->read_count_limit = 0;  // 0 = no limit
 
 		info->timing_mode = MODE_SHORT;
 		info->do_icarus_timing = true;
@@ -380,6 +331,7 @@ static void set_timing_mode(int this_option_offset, struct cgpu_info *icarus)
 	} else if (strcasecmp(buf, MODE_LONG_STR) == 0) {
 		// long
 		info->read_count = ICARUS_READ_COUNT_TIMING;
+		info->read_count_limit = 0;  // 0 = no limit
 
 		info->timing_mode = MODE_LONG;
 		info->do_icarus_timing = true;
@@ -400,6 +352,7 @@ static void set_timing_mode(int this_option_offset, struct cgpu_info *icarus)
 		info->Hs = Hs / NANOSEC;
 		info->fullnonce = info->Hs * (((double)0xffffffff) + 1);
 
+		info->read_count = 0;
 		if ((eq = strchr(buf, '=')) != NULL)
 			info->read_count = atoi(eq+1);
 
@@ -409,6 +362,8 @@ static void set_timing_mode(int this_option_offset, struct cgpu_info *icarus)
 		if (unlikely(info->read_count < 1))
 			info->read_count = 1;
 
+		info->read_count_limit = 0;  // 0 = no limit
+		
 		info->timing_mode = MODE_VALUE;
 		info->do_icarus_timing = false;
 	} else {
@@ -416,13 +371,14 @@ static void set_timing_mode(int this_option_offset, struct cgpu_info *icarus)
 
 		info->fullnonce = info->Hs * (((double)0xffffffff) + 1);
 
+		info->read_count = 0;
 		if ((eq = strchr(buf, '=')) != NULL)
 			info->read_count = atoi(eq+1);
 
 		int def_read_count = ICARUS_READ_COUNT_TIMING;
 
 		if (info->timing_mode == MODE_DEFAULT) {
-			if (icarus->drv == &icarus_drv) {
+			if (proc->drv == &icarus_drv) {
 				info->do_default_detection = 0x10;
 			} else {
 				def_read_count = (int)(info->fullnonce * TIME_FACTOR) - 1;
@@ -432,14 +388,18 @@ static void set_timing_mode(int this_option_offset, struct cgpu_info *icarus)
 		}
 		if (info->read_count < 1)
 			info->read_count = def_read_count;
+		
+		info->read_count_limit = 0;  // 0 = no limit
 	}
 
 	info->min_data_count = MIN_DATA_COUNT;
 
 	applog(LOG_DEBUG, "%"PRIpreprv": Init: mode=%s read_count=%d limit=%dms Hs=%e",
-		icarus->proc_repr,
+		proc->proc_repr,
 		timing_mode_str(info->timing_mode),
 		info->read_count, info->read_count_limit, info->Hs);
+	
+	return NULL;
 }
 
 static uint32_t mask(int work_division)
@@ -461,106 +421,35 @@ static uint32_t mask(int work_division)
 		nonce_mask = 0x1fffffff;
 		break;
 	default:
-		quit(1, "Invalid2 icarus-options for work_division (%d) must be 1, 2, 4 or 8", work_division);
+		quit(1, "Invalid2 work_division (%d) must be 1, 2, 4 or 8", work_division);
 	}
 
 	return nonce_mask;
 }
 
-static void get_options(int this_option_offset, struct ICARUS_INFO *info)
+// Number of bytes remaining after reading a nonce from Icarus
+int icarus_excess_nonce_size(int fd, struct ICARUS_INFO *info)
 {
-	int *baud = &info->baud;
-	int *work_division = &info->work_division;
-	int *fpga_count = &info->fpga_count;
+	// How big a buffer?
+	int excess_size = info->read_size - ICARUS_NONCE_SIZE;
 
-	char buf[BUFSIZ+1];
-	char *ptr, *comma, *colon, *colon2;
-	size_t max;
-	int i, tmp;
+	// Try to read one more to ensure the device doesn't return
+	// more than we want for this driver
+	excess_size++;
 
-	if (opt_icarus_options == NULL)
-		buf[0] = '\0';
-	else {
-		ptr = opt_icarus_options;
-		for (i = 0; i < this_option_offset; i++) {
-			comma = strchr(ptr, ',');
-			if (comma == NULL)
-				break;
-			ptr = comma + 1;
-		}
+	unsigned char excess_bin[excess_size];
+	// Read excess_size from Icarus
+	struct timeval tv_now;
+	timer_set_now(&tv_now);
+	//icarus_gets(excess_bin, fd, &tv_now, NULL, 1, excess_size);
+	int bytes_read = read(fd, excess_bin, excess_size);
+	// Number of bytes that were still available
 
-		comma = strchr(ptr, ',');
-		if (comma == NULL)
-			max = strlen(ptr);
-		else
-			max = comma - ptr;
-
-		if (max > BUFSIZ)
-			max = BUFSIZ;
-		strncpy(buf, ptr, max);
-		buf[max] = '\0';
-	}
-
-	if (*buf) {
-		colon = strchr(buf, ':');
-		if (colon)
-			*(colon++) = '\0';
-
-		if (*buf) {
-			tmp = atoi(buf);
-			if (!valid_baud(*baud = tmp))
-				quit(1, "Invalid icarus-options for baud (%s)", buf);
-		}
-
-		if (colon && *colon) {
-			colon2 = strchr(colon, ':');
-			if (colon2)
-				*(colon2++) = '\0';
-
-			if (*colon) {
-				info->user_set |= 1;
-				tmp = atoi(colon);
-				if (tmp == 1 || tmp == 2 || tmp == 4 || tmp == 8) {
-					*work_division = tmp;
-					*fpga_count = tmp;	// default to the same
-				} else {
-					quit(1, "Invalid icarus-options for work_division (%s) must be 1, 2, 4 or 8", colon);
-				}
-			}
-
-			if (colon2 && *colon2) {
-			  colon = strchr(colon2, ':');
-			  if (colon)
-					*(colon++) = '\0';
-
-			  if (*colon2) {
-				info->user_set |= 2;
-				tmp = atoi(colon2);
-				if (tmp > 0 && tmp <= *work_division)
-					*fpga_count = tmp;
-				else {
-					quit(1, "Invalid icarus-options for fpga_count (%s) must be >0 and <=work_division (%d)", colon2, *work_division);
-				}
-			  }
-
-			  if (colon && *colon) {
-					colon2 = strchr(colon, '-') ?: "";
-					if (*colon2)
-						*(colon2++) = '\0';
-					if (strchr(colon, 'r'))
-						info->quirk_reopen = 2;
-					if (strchr(colon2, 'r'))
-						info->quirk_reopen = 0;
-			  }
-			}
-		}
-	}
+	return bytes_read;
 }
 
 bool icarus_detect_custom(const char *devpath, struct device_drv *api, struct ICARUS_INFO *info)
 {
-	int this_option_offset = ++option_offset;
-
 	struct timeval tv_start, tv_finish;
 	int fd;
 
@@ -582,43 +471,67 @@ bool icarus_detect_custom(const char *devpath, struct device_drv *api, struct IC
 
 	const char golden_nonce[] = "000187a2";
 
-	unsigned char ob_bin[64], nonce_bin[ICARUS_READ_SIZE];
+	unsigned char ob_bin[64], nonce_bin[ICARUS_NONCE_SIZE];
 	char nonce_hex[(sizeof(nonce_bin) * 2) + 1];
 
-	get_options(this_option_offset, info);
+	drv_set_defaults(api, icarus_set_device_funcs, info, devpath, detectone_meta_info.serial, 1);
 
 	int baud = info->baud;
 	int work_division = info->work_division;
 	int fpga_count = info->fpga_count;
 
-	applog(LOG_DEBUG, "Icarus Detect: Attempting to open %s", devpath);
+	applog(LOG_DEBUG, "%s: Attempting to open %s", api->dname, devpath);
 
 	fd = icarus_open2(devpath, baud, true);
 	if (unlikely(fd == -1)) {
-		applog(LOG_DEBUG, "Icarus Detect: Failed to open %s", devpath);
+		applog(LOG_DEBUG, "%s: Failed to open %s", api->dname, devpath);
 		return false;
 	}
+	
+	// Set a default so that individual drivers need not specify
+	// e.g. Cairnsmore
+	if (info->read_size == 0)
+		info->read_size = ICARUS_DEFAULT_READ_SIZE;
 
 	hex2bin(ob_bin, golden_ob, sizeof(ob_bin));
 	icarus_write(fd, ob_bin, sizeof(ob_bin));
 	cgtime(&tv_start);
 
 	memset(nonce_bin, 0, sizeof(nonce_bin));
-	icarus_gets(nonce_bin, fd, &tv_finish, NULL, 1);
-
+	// Do not use info->read_size here, instead read exactly ICARUS_NONCE_SIZE
+	// We will then compare the bytes left in fd with info->read_size to determine
+	// if this is a valid device
+	icarus_gets(nonce_bin, fd, &tv_finish, NULL, 1, ICARUS_NONCE_SIZE);
+	
+	// How many bytes were left after reading the above nonce
+	int bytes_left = icarus_excess_nonce_size(fd, info);
+	
 	icarus_close(fd);
 
 	bin2hex(nonce_hex, nonce_bin, sizeof(nonce_bin));
 	if (strncmp(nonce_hex, golden_nonce, 8)) {
 		applog(LOG_DEBUG,
-			"Icarus Detect: "
+			"%s: "
 			"Test failed at %s: get %s, should: %s",
+			api->dname,
 			devpath, nonce_hex, golden_nonce);
 		return false;
 	}
+		
+	if (info->read_size - ICARUS_NONCE_SIZE != bytes_left) 
+	{
+		applog(LOG_DEBUG,
+			   "%s: "
+			   "Test failed at %s: expected %d bytes, got %d",
+			   api->dname,
+			   devpath, info->read_size, ICARUS_NONCE_SIZE + bytes_left);
+		return false;
+	}
+	
 	applog(LOG_DEBUG,
-		"Icarus Detect: "
+		"%s: "
 		"Test succeeded at %s: got %s",
+	       api->dname,
 			devpath, nonce_hex);
 
 	if (serial_claim_v(devpath, api))
@@ -631,6 +544,7 @@ bool icarus_detect_custom(const char *devpath, struct device_drv *api, struct IC
 	icarus->device_path = strdup(devpath);
 	icarus->device_fd = -1;
 	icarus->threads = 1;
+	icarus->set_device_funcs = icarus_set_device_funcs;
 	add_cgpu(icarus);
 
 	applog(LOG_INFO, "Found %"PRIpreprv" at %s",
@@ -644,8 +558,7 @@ bool icarus_detect_custom(const char *devpath, struct device_drv *api, struct IC
 	icarus->device_data = info;
 
 	timersub(&tv_finish, &tv_start, &(info->golden_tv));
-
-	set_timing_mode(this_option_offset, icarus);
+	icarus_set_timing(icarus, NULL, "", NULL, NULL);
 
 	return true;
 }
@@ -660,9 +573,10 @@ static bool icarus_detect_one(const char *devpath)
 	// if they support them and if setting them makes any difference
 	// N.B. B3000000 doesn't work on Icarus
 	info->baud = ICARUS_IO_SPEED;
-	info->quirk_reopen = 1;
+	info->reopen_mode = IRM_TIMEOUT;
 	info->Hs = ICARUS_REV3_HASH_TIME;
 	info->timing_mode = MODE_DEFAULT;
+	info->read_size = ICARUS_DEFAULT_READ_SIZE;
 
 	if (!icarus_detect_custom(devpath, &icarus_drv, info)) {
 		free(info);
@@ -686,14 +600,15 @@ static bool icarus_prepare(struct thr_info *thr)
 
 	int fd = icarus_open2(icarus->device_path, info->baud, true);
 	if (unlikely(-1 == fd)) {
-		applog(LOG_ERR, "Failed to open Icarus on %s",
+		applog(LOG_ERR, "%s: Failed to open %s",
+		       icarus->dev_repr,
 		       icarus->device_path);
 		return false;
 	}
 
 	icarus->device_fd = fd;
 
-	applog(LOG_INFO, "Opened Icarus on %s", icarus->device_path);
+	applog(LOG_INFO, "%s: Opened %s", icarus->dev_repr, icarus->device_path);
 
 	struct icarus_state *state;
 	thr->cgpu_data = state = calloc(1, sizeof(*state));
@@ -722,6 +637,10 @@ static bool icarus_init(struct thr_info *thr)
 	if (!info->work_division)
 	{
 		struct timeval tv_finish;
+		
+		// For reading the nonce from Icarus
+		unsigned char res_bin[info->read_size];
+		// For storing the the 32-bit nonce
 		uint32_t res;
 		
 		applog(LOG_DEBUG, "%"PRIpreprv": Work division not specified - autodetecting", icarus->proc_repr);
@@ -734,8 +653,12 @@ static bool icarus_init(struct thr_info *thr)
 			"BFG\0\x64\x61\x01\x1a\xc9\x06\xa9\x51\xfb\x9b\x3c\x73";
 		
 		icarus_write(fd, pkt, sizeof(pkt));
-		if (ICA_GETS_OK == icarus_gets((unsigned char*)&res, fd, &tv_finish, NULL, info->read_count))
+		memset(res_bin, 0, sizeof(res_bin));
+		if (ICA_GETS_OK == icarus_gets(res_bin, fd, &tv_finish, NULL, info->read_count, info->read_size))
+		{
+			memcpy(&res, res_bin, sizeof(res));
 			res = be32toh(res);
+		}
 		else
 			res = 0;
 		
@@ -862,6 +785,10 @@ void handle_identify(struct thr_info * const thr, int ret, const bool was_first_
 	int fd = icarus->device_fd;
 	struct timeval tv_now;
 	double delapsed;
+	
+	// For reading the nonce from Icarus
+	unsigned char nonce_bin[info->read_size];
+	// For storing the the 32-bit nonce
 	uint32_t nonce;
 	
 	if (fd == -1)
@@ -882,9 +809,11 @@ void handle_identify(struct thr_info * const thr, int ret, const bool was_first_
 				break;
 			
 			// Try to get more nonces (ignoring work restart)
-			ret = icarus_gets((void *)&nonce, fd, &tv_now, NULL, (info->fullnonce - delapsed) * 10);
+			memset(nonce_bin, 0, sizeof(nonce_bin));
+			ret = icarus_gets(nonce_bin, fd, &tv_now, NULL, (info->fullnonce - delapsed) * 10, info->read_size);
 			if (ret == ICA_GETS_OK)
 			{
+				memcpy(&nonce, nonce_bin, sizeof(nonce));
 				nonce = be32toh(nonce);
 				submit_nonce(thr, state->last_work, nonce);
 			}
@@ -934,7 +863,6 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 
 	struct ICARUS_INFO *info;
 
-	uint32_t nonce;
 	struct work *nonce_work;
 	int64_t hash_count;
 	struct timeval tv_start = {.tv_sec=0}, elapsed;
@@ -964,6 +892,11 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 	// Wait for the previous run's result
 	fd = icarus->device_fd;
 	info = icarus->device_data;
+	
+	// For reading the nonce from Icarus
+	unsigned char nonce_bin[info->read_size];
+	// For storing the the 32-bit nonce
+	uint32_t nonce;
 
 	if (unlikely(fd == -1) && !icarus_reopen(icarus, state, &fd))
 		return -1;
@@ -978,8 +911,9 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 		{
 			read_count = info->read_count;
 keepwaiting:
-			/* Icarus will return 4 bytes (ICARUS_READ_SIZE) nonces or nothing */
-			ret = icarus_gets((void*)&nonce, fd, &state->tv_workfinish, thr, read_count);
+			/* Icarus will return info->read_size bytes nonces or nothing */
+			memset(nonce_bin, 0, sizeof(nonce_bin));
+			ret = icarus_gets(nonce_bin, fd, &state->tv_workfinish, thr, read_count, info->read_size);
 			switch (ret) {
 				case ICA_GETS_RESTART:
 					// The prepared work is invalid, and the current work is abandoned
@@ -995,7 +929,7 @@ keepwaiting:
 						return -1;
 					break;
 				case ICA_GETS_TIMEOUT:
-					if (info->quirk_reopen == 1 && !icarus_reopen(icarus, state, &fd))
+					if (info->reopen_mode == IRM_TIMEOUT && !icarus_reopen(icarus, state, &fd))
 						return -1;
 				case ICA_GETS_OK:
 					break;
@@ -1020,6 +954,7 @@ keepwaiting:
 
 	if (ret == ICA_GETS_OK)
 	{
+		memcpy(&nonce, nonce_bin, sizeof(nonce));
 		nonce_work = icarus_process_worknonce(state, &nonce);
 		if (likely(nonce_work))
 		{
@@ -1053,8 +988,13 @@ keepwaiting:
 			dclk_errorCount(&info->dclk, qsec);
 	}
 	
-	// Force a USB close/reopen on any hw error
-	if (was_hw_error && info->quirk_reopen != 2) {
+	// Force a USB close/reopen on any hw error (or on request, eg for baud change)
+	if (was_hw_error || info->reopen_now)
+	{
+		info->reopen_now = false;
+		if (info->reopen_mode == IRM_CYCLE)
+		{}  // Do nothing here, we reopen after sending the job
+		else
 		if (!icarus_reopen(icarus, state, &fd))
 			state->firstrun = true;
 	}
@@ -1067,7 +1007,7 @@ keepwaiting:
 	if (unlikely(icarus->deven != DEV_ENABLED || !icarus_job_start(thr)))
 		state->firstrun = true;
 
-	if (info->quirk_reopen == 2 && !icarus_reopen(icarus, state, &fd))
+	if (info->reopen_mode == IRM_CYCLE && !icarus_reopen(icarus, state, &fd))
 		state->firstrun = true;
 
 	work->blk.nonce = 0xffffffff;
@@ -1168,7 +1108,7 @@ keepwaiting:
 
 		Ti = (double)(elapsed.tv_sec)
 			+ ((double)(elapsed.tv_usec))/((double)1000000)
-			- ((double)ICARUS_READ_TIME(info->baud));
+			- ((double)ICARUS_READ_TIME(info->baud, info->read_size));
 		Xi = (double)hash_count;
 		history0->sumXiTi += Xi * Ti;
 		history0->sumXi += Xi;
@@ -1297,16 +1237,93 @@ static struct api_data *icarus_drv_stats(struct cgpu_info *cgpu)
 	return root;
 }
 
+static
+const char *icarus_set_baud(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct ICARUS_INFO * const info = proc->device_data;
+	const int baud = atoi(newvalue);
+	if (!valid_baud(baud))
+		return "Invalid baud setting";
+	if (info->baud != baud)
+	{
+		info->baud = baud;
+		info->reopen_now = true;
+	}
+	return NULL;
+}
+
+static
+const char *icarus_set_work_division(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct ICARUS_INFO * const info = proc->device_data;
+	const int work_division = atoi(newvalue);
+	if (!(work_division == 1 || work_division == 2 || work_division == 4 || work_division == 8))
+		return "Invalid work_division: must be 1, 2, 4 or 8";
+	if (info->user_set & IUS_FPGA_COUNT)
+	{
+		if (info->fpga_count > work_division)
+			return "work_division must be >= fpga_count";
+	}
+	else
+		info->fpga_count = work_division;
+	info->user_set |= IUS_WORK_DIVISION;
+	info->work_division = work_division;
+	info->nonce_mask = mask(work_division);
+	return NULL;
+}
+
+static
+const char *icarus_set_fpga_count(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct ICARUS_INFO * const info = proc->device_data;
+	const int fpga_count = atoi(newvalue);
+	if (fpga_count < 1 || fpga_count > info->work_division)
+		return "Invalid fpga_count: must be >0 and <=work_division";
+	info->fpga_count = fpga_count;
+	return NULL;
+}
+
+static
+const char *icarus_set_reopen(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct ICARUS_INFO * const info = proc->device_data;
+	if ((!strcasecmp(newvalue, "never")) || !strcasecmp(newvalue, "-r"))
+		info->reopen_mode = IRM_NEVER;
+	else
+	if (!strcasecmp(newvalue, "timeout"))
+		info->reopen_mode = IRM_TIMEOUT;
+	else
+	if ((!strcasecmp(newvalue, "cycle")) || !strcasecmp(newvalue, "r"))
+		info->reopen_mode = IRM_CYCLE;
+	else
+	if (!strcasecmp(newvalue, "now"))
+		info->reopen_now = true;
+	else
+		return "Invalid reopen mode";
+	return NULL;
+}
+
 static void icarus_shutdown(struct thr_info *thr)
 {
 	do_icarus_close(thr);
 	free(thr->cgpu_data);
 }
 
+const struct bfg_set_device_definition icarus_set_device_funcs[] = {
+	// NOTE: Order of parameters below is important for --icarus-options
+	{"baud"         , icarus_set_baud         , "serial baud rate"},
+	{"work_division", icarus_set_work_division, "number of pieces work is split into"},
+	{"fpga_count"   , icarus_set_fpga_count   , "number of chips working on pieces"},
+	{"reopen"       , icarus_set_reopen       , "how often to reopen device: never, timeout, cycle, (or now for a one-shot reopen)"},
+	// NOTE: Below here, order is irrelevant
+	{"timing"       , icarus_set_timing       , "timing of device; see README.FPGA"},
+	{NULL},
+};
+
 struct device_drv icarus_drv = {
 	.dname = "icarus",
 	.name = "ICA",
-	.probe_priority = -120,
+	.probe_priority = -115,
 	.lowl_probe = icarus_lowl_probe,
 	.get_api_stats = icarus_drv_stats,
 	.thread_prepare = icarus_prepare,

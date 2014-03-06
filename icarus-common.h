@@ -28,6 +28,13 @@
 
 #define NANOSEC 1000000000.0
 
+// Default value for ICARUS_INFO->read_size
+#define ICARUS_DEFAULT_READ_SIZE 4
+
+#define ICA_GETS_ERROR -1
+#define ICA_GETS_OK 0
+#define ICA_GETS_RESTART 1
+#define ICA_GETS_TIMEOUT 2
 
 // Store the last INFO_HISTORY data sets
 // [0] = current data, not yet ready to be included as an estimate
@@ -49,6 +56,15 @@ struct ICARUS_HISTORY {
 };
 
 enum timing_mode { MODE_DEFAULT, MODE_SHORT, MODE_LONG, MODE_VALUE };
+enum icarus_reopen_mode {
+	IRM_NEVER,
+	IRM_TIMEOUT,
+	IRM_CYCLE,
+};
+enum icarus_user_settings {
+	IUS_WORK_DIVISION = 1,
+	IUS_FPGA_COUNT    = 2,
+};
 
 struct ICARUS_INFO {
 	// time to calculate the golden_ob
@@ -83,12 +99,16 @@ struct ICARUS_INFO {
 	int work_division;
 	int fpga_count;
 	uint32_t nonce_mask;
-	int quirk_reopen;
+	enum icarus_reopen_mode reopen_mode;
+	bool reopen_now;
 	uint8_t user_set;
 	bool continue_search;
 
 	dclk_change_clock_func_t dclk_change_clock_func;
 	struct dclk_data dclk;
+	
+	// Bytes to read from Icarus for nonce
+	int read_size;
 };
 
 struct icarus_state {
@@ -104,6 +124,7 @@ struct icarus_state {
 };
 
 bool icarus_detect_custom(const char *devpath, struct device_drv *, struct ICARUS_INFO *);
-extern int icarus_gets(unsigned char *, int fd, struct timeval *tv_finish, struct thr_info *, int read_count);
+extern int icarus_gets(unsigned char *, int fd, struct timeval *tv_finish, struct thr_info *, int read_count, int read_size);
+extern int icarus_write(int fd, const void *buf, size_t bufLen);
 
 #endif

@@ -1982,18 +1982,30 @@ static bool parse_diff(struct pool *pool, json_t *val)
 
 static bool parse_reconnect(struct pool *pool, json_t *val)
 {
-	const char *url, *port;
+	const char *url;
 	char address[256];
+	json_t *port_json;
 
 	url = __json_array_string(val, 0);
 	if (!url)
 		url = pool->sockaddr_url;
 
-	port = __json_array_string(val, 1);
-	if (!port)
-		port = pool->stratum_port;
-
-	snprintf(address, sizeof(address), "%s:%s", url, port);
+	port_json = json_array_get(val, 1);
+	if (json_is_number(port_json))
+	{
+		const unsigned port = json_number_value(port_json);
+		snprintf(address, sizeof(address), "%s:%u", url, port);
+	}
+	else
+	{
+		const char *port;
+		if (json_is_string(port_json))
+			port = json_string_value(port_json);
+		else
+			port = pool->stratum_port;
+		
+		snprintf(address, sizeof(address), "%s:%s", url, port);
+	}
 
 	if (!extract_sockaddr(address, &pool->sockaddr_url, &pool->stratum_port))
 		return false;
@@ -2847,6 +2859,39 @@ void notifier_init(notifier_t pipefd)
 #endif
 }
 
+
+void *bfg_slurp_file(void * const bufp, size_t bufsz, const char * const filename)
+{
+	char *buf = bufp;
+	FILE * const F = fopen(filename, "r");
+	if (!F)
+		goto err;
+	
+	if (!buf)
+	{
+		fseek(F, 0, SEEK_END);
+		const long filesz = ftell(F);
+		if (unlikely(filesz < 0))
+		{
+			fclose(F);
+			goto err;
+		}
+		rewind(F);
+		bufsz = filesz + 1;
+		buf = malloc(bufsz);
+	}
+	const size_t rsz = fread(buf, 1, bufsz - 1, F);
+	fclose(F);
+	buf[rsz] = '\0';
+	return buf;
+
+err:
+	if (buf)
+		buf[0] = '\0';
+	return NULL;
+}
+
+
 void notifier_wake(notifier_t fd)
 {
 	if (fd[1] == INVSOCK)
@@ -2894,6 +2939,24 @@ void _bytes_alloc_failure(size_t sz)
 }
 
 
+char *trimmed_strdup(const char *s)
+{
+	size_t n;
+	char *c;
+	
+	while (isspace(s[0]))
+		++s;
+	n = strlen(s) - 1;
+	while (isspace(s[n]))
+		--n;
+	++n;
+	c = malloc(n + 1);
+	c[n] = '\0';
+	memcpy(c, s, n);
+	return c;
+}
+
+
 void *cmd_thread(void *cmdp)
 {
 	const char *cmd = cmdp;
@@ -2910,4 +2973,82 @@ void run_cmd(const char *cmd)
 		return;
 	pthread_t pth;
 	pthread_create(&pth, NULL, cmd_thread, (void*)cmd);
+}
+
+
+uint8_t crc5usb(unsigned char *ptr, uint8_t len)
+{
+    uint8_t i, j, k;
+    uint8_t crc = 0x1f;
+	
+    uint8_t crcin[5] = {1, 1, 1, 1, 1};
+    uint8_t crcout[5] = {1, 1, 1, 1, 1};
+    uint8_t din = 0;
+	
+    j = 0x80;
+    k = 0;
+	
+    for (i = 0; i < len; i++)
+    {
+    	if (*ptr & j)
+    		din = 1;
+    	else
+    		din = 0;
+		
+    	crcout[0] = crcin[4] ^ din;
+    	crcout[1] = crcin[0];
+    	crcout[2] = crcin[1] ^ crcin[4] ^ din;
+    	crcout[3] = crcin[2];
+    	crcout[4] = crcin[3];
+		
+        j = j >> 1;
+        k++;
+        if (k == 8)
+        {
+            j = 0x80;
+            k = 0;
+            ptr++;
+        }
+        memcpy(crcin, crcout, 5);
+    }
+	
+    crc = 0;
+    if(crcin[4])
+    	crc |= 0x10;
+	
+    if(crcin[3])
+    	crc |= 0x08;
+	
+    if(crcin[2])
+    	crc |= 0x04;
+	
+    if(crcin[1])
+    	crc |= 0x02;
+	
+    if(crcin[0])
+    	crc |= 0x01;
+	
+    return crc;
+}
+
+static uint8_t _crc8ccitt_table[0x100];
+
+void bfg_init_checksums(void)
+{
+	for (int i = 0; i < 0x100; ++i)
+	{
+		uint8_t crc = i;
+		for (int j = 0; j < 8; ++j)
+			crc = (crc << 1) ^ ((crc & 0x80) ? 7 : 0);
+		_crc8ccitt_table[i] = crc & 0xff;
+	}
+}
+
+uint8_t crc8ccitt(const void * const buf, const size_t buflen)
+{
+	const uint8_t *p = buf;
+	uint8_t crc = 0xff;
+	for (int i = 0; i < buflen; ++i)
+		crc = _crc8ccitt_table[crc ^ *p++];
+	return crc;
 }

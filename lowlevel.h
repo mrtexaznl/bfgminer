@@ -1,5 +1,5 @@
-#ifndef _BFG_LOWLEVEL_H
-#define _BFG_LOWLEVEL_H
+#ifndef BFG_LOWLEVEL_H
+#define BFG_LOWLEVEL_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -65,6 +65,9 @@ extern struct lowlevel_driver lowl_hid;
 #endif
 #ifdef USE_NANOFURY
 extern struct lowlevel_driver lowl_mcp2210;
+#endif
+#ifdef NEED_BFG_LOWL_PCI
+extern struct lowlevel_driver lowl_pci;
 #endif
 #ifdef HAVE_LIBUSB
 extern struct lowlevel_driver lowl_usb;

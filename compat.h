@@ -7,8 +7,8 @@
  * any later version.  See COPYING for more details.
  */
 
-#ifndef __COMPAT_H__
-#define __COMPAT_H__
+#ifndef BFG_COMPAT_H
+#define BFG_COMPAT_H
 
 #include "config.h"
 
@@ -184,6 +184,10 @@ typedef long suseconds_t;
 #endif
 
 #endif /* WIN32 */
+
+#ifndef HAVE_LOG2
+#	define log2(n)  (log(n) / log(2))
+#endif
 
 #ifndef HAVE_PTHREAD_CANCEL
 

@@ -26,15 +26,15 @@ dist_rpcexamples_DATA = \
 		  api-example.c \
                   api-example.py
 
-SUBDIRS		= lib ccan
+SUBDIRS		= lib ccan.bfg
 
 # Without a redirected rule, code depending on different lib/*.h files may try to build dependencies of that in parallel, which can fail
 lib/%: lib_directory
 	@test -e $@
 lib_directory:
 	$(MAKE) -C lib
-ccan/libccan.a:
-	$(MAKE) -C ccan $*
+ccan.bfg/libccan.a:
+	$(MAKE) -C ccan.bfg $*
 
 INCLUDES	= -fno-strict-aliasing
 
@@ -44,11 +44,12 @@ bfgminer_LDFLAGS	= $(PTHREAD_FLAGS)
 bfgminer_LDADD	= $(DLOPEN_FLAGS) @LIBCURL_LIBS@ @JANSSON_LIBS@ @PTHREAD_LIBS@ \
 		  @NCURSES_LIBS@ @PDCURSES_LIBS@ @WS2_LIBS@ \
 		  @UDEV_LIBS@ @LIBUSB_LIBS@ @MM_LIBS@ @RT_LIBS@ \
-		  @MATH_LIBS@ lib/libgnu.a ccan/libccan.a
+		  @MATH_LIBS@ lib/libgnu.a ccan.bfg/libccan.a
 bfgminer_CPPFLAGS = -I$(top_builddir)/lib -I$(top_srcdir)/lib @LIBUSB_CFLAGS@ @LIBCURL_CFLAGS@
 
 bfgminer_CPPFLAGS += -DCGMINER_PREFIX='"$(pkgdatadir)"'
 
+bfgminer_CPPFLAGS += -I$(top_srcdir)/ccan-upstream
 bfgminer_CPPFLAGS += @JANSSON_CFLAGS@
 bfgminer_CPPFLAGS += $(PTHREAD_FLAGS)
 bfgminer_CPPFLAGS += $(NCURSES_CPPFLAGS)
@@ -63,7 +64,7 @@ bfgminer_CPPFLAGS += $(libblkmaker_CFLAGS)
 # common sources
 bfgminer_SOURCES := miner.c hybrid.cpp
 
-bfgminer_SOURCES	+= miner.h compat.h bench_block.h	\
+bfgminer_SOURCES += miner.h compat.h  \
 	deviceapi.c deviceapi.h \
 		   util.c util.h logging.h		\
 		   sha2.c sha2.h api.c
@@ -142,6 +143,7 @@ bfgminer_SOURCES	+= \
 
 # the CPU portion extracted from original main.c
 bfgminer_SOURCES += driver-cpu.h driver-cpu.c
+bfgminer_SOURCES += bench_block.h
 
 if HAVE_SSE2
 bfgminer_LDADD  += libsse2cpuminer.a
@@ -218,6 +220,10 @@ if HAS_BIGPIC
 bfgminer_SOURCES += driver-bigpic.c driver-bigpic.h
 endif
 
+if USE_DRILLBIT
+bfgminer_SOURCES += driver-drillbit.c
+endif
+
 if HAS_TWINFURY
 bfgminer_SOURCES += driver-twinfury.c driver-twinfury.h
 endif
@@ -226,6 +232,7 @@ if HAS_ICARUS
 bfgminer_SOURCES += driver-icarus.c icarus-common.h
 bfgminer_SOURCES += driver-cairnsmore.c
 bfgminer_SOURCES += driver-erupter.c
+bfgminer_SOURCES += driver-antminer.c
 endif
 
 if HAS_AVALON
@@ -237,7 +244,7 @@ bfgminer_SOURCES += driver-knc.c
 endif
 
 if HAS_KLONDIKE
-bfgminer_SOURCES += driver-klondike.c
+bfgminer_SOURCES += driver-klondike.c driver-klondike.h driver-hashbusteravalon.c
 endif
 
 if HAS_MODMINER
@@ -285,9 +292,17 @@ endif
 
 endif
 
+if USE_HASHFAST
+bfgminer_SOURCES += driver-hashfast.c
+endif
+
 if NEED_BFG_LOWL_HID
 bfgminer_SOURCES += lowl-hid.c lowl-hid.h
 bfgminer_CPPFLAGS += $(hidapi_CFLAGS)
+endif
+
+if NEED_BFG_LOWL_PCI
+bfgminer_SOURCES += lowl-pci.c lowl-pci.h
 endif
 
 bin_PROGRAMS += bfgminer-rpc
