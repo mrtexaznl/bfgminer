@@ -74,8 +74,9 @@ struct work {
 	int		rolls;
 	int		drv_rolllimit; /* How much the driver can roll ntime */
 
-
-	dev_blk_ctx	blk;
+	struct {
+		uint32_t nonce;
+	} blk;
 
 	struct thr_info	*thr;
 	int		thr_id;
@@ -101,12 +102,18 @@ struct work {
 	int		id;
 	int		device_id;
 	UT_hash_handle hh;
+
+	// Please don't use this if it's at all possible, I'd like to get rid of it eventually.
+	void *device_data;
+	void *(*device_data_dup_func)(struct work *);
+	void (*device_data_free_func)(struct work *);
 	
 	double		work_difficulty;
+	float		nonce_diff;
 
 	// Allow devices to identify work if multiple sub-devices
 	// DEPRECATED: New code should be using multiple processors instead
-	unsigned char	subid;
+	int		subid;
 	
 	// Allow devices to timestamp work for their own purposes
 	struct timeval	tv_stamp;
@@ -124,6 +131,7 @@ struct work {
 	struct timeval	tv_work_found;
 	char		getwork_mode;
 
+	
 	// for HybridScryptHash256
 	unsigned char	hybridsch256_data[128]; // original data
 	int hybrid_state;
