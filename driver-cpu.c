@@ -1,6 +1,6 @@
 /*
- * Copyright 2011-2012 Con Kolivas
- * Copyright 2011-2013 Luke Dashjr
+ * Copyright 2011-2013 Con Kolivas
+ * Copyright 2011-2014 Luke Dashjr
  * Copyright 2010 Jeff Garzik
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -32,7 +32,6 @@
 #include "compat.h"
 #include "deviceapi.h"
 #include "miner.h"
-#include "bench_block.h"
 #include "logging.h"
 #include "util.h"
 #include "driver-cpu.h"
@@ -135,9 +134,7 @@ extern bool scanhash_sse2_32(struct thr_info*, const unsigned char *pmidstate, u
 	uint32_t max_nonce, uint32_t *last_nonce,
 	uint32_t nonce);
 
-extern bool scanhash_scrypt(struct thr_info *thr, int thr_id, unsigned char *pdata, unsigned char *scratchbuf,
-	const unsigned char *ptarget,
-	uint32_t max_nonce, unsigned long *hashes_done);
+extern bool scanhash_scrypt(struct thr_info *, const unsigned char *pmidstate, unsigned char *pdata, unsigned char *phash1, unsigned char __maybe_unused *phash, const unsigned char *ptarget, uint32_t max_nonce, uint32_t *last_nonce, uint32_t nonce);
 
 
 
@@ -228,16 +225,10 @@ double bench_algo_stage3(
 	enum sha256_algos algo
 )
 {
-	// Use a random work block pulled from a pool
-	static uint8_t bench_block[] = { CGMINER_BENCHMARK_BLOCK };
 	struct work work __attribute__((aligned(128)));
 	unsigned char hash1[64];
 
-	size_t bench_size = sizeof(work);
-	size_t work_size = sizeof(bench_block);
-	size_t min_size = (work_size < bench_size ? work_size : bench_size);
-	memset(&work, 0, sizeof(work));
-	memcpy(&work, &bench_block, min_size);
+	get_benchmark_work(&work);
 
 	static struct thr_info dummy;
 
@@ -260,7 +251,7 @@ double bench_algo_stage3(
 					work.target,
 					max_nonce,
 					&last_nonce,
-					work.blk.nonce
+					0
 				);
 			}
 	timer_set_now(&end);
@@ -474,9 +465,9 @@ static double bench_algo_stage2(
 		}
 
 		// Construct new command line based on that
-		char *p = strlen(cmd_line) + cmd_line;
-		sprintf(p, " --bench-algo %d", algo);
-		SetEnvironmentVariable("BFGMINER_BENCH_ALGO", "1");
+		char buf[0x20];
+		snprintf(buf, sizeof(buf), "%d", algo);
+		SetEnvironmentVariable("BFGMINER_BENCH_ALGO", buf);
 
 		// Launch a debug copy of BFGMiner
 		STARTUPINFO startup_info;

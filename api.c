@@ -1,7 +1,7 @@
 /*
- * Copyright 2011-2013 Andrew Smith
- * Copyright 2011-2013 Con Kolivas
- * Copyright 2012-2013 Luke Dashjr
+ * Copyright 2011-2014 Andrew Smith
+ * Copyright 2011-2014 Con Kolivas
+ * Copyright 2012-2014 Luke Dashjr
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -16,6 +16,7 @@
 
 #include "config.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -34,6 +35,7 @@
 #include "util.h"
 #include "driver-cpu.h" /* for algo_names[], TODO: re-factor dependency */
 #include "driver-opencl.h"
+#include "version.h"
 
 #define HAVE_AN_FPGA 1
 
@@ -169,8 +171,6 @@ static const char ISJSON = '{';
 #define JSON_CPUS	JSON1 _CPUS JSON2
 #define JSON_NOTIFY	JSON1 _NOTIFY JSON2
 #define JSON_DEVDETAILS	JSON1 _DEVDETAILS JSON2
-#define JSON_BYE	JSON1 _BYE JSON1
-#define JSON_RESTART	JSON1 _RESTART JSON1
 #define JSON_CLOSE	JSON3
 #define JSON_MINESTATS	JSON1 _MINESTATS JSON2
 #define JSON_CHECK	JSON1 _CHECK JSON2
@@ -305,6 +305,7 @@ static const char *JSON_PARAMETER = "parameter";
 #define MSG_ZERNOSUM 97
 
 #define MSG_DEVSCAN 0x100
+#define MSG_BYE 0x101
 
 #define MSG_INVNEG 121
 #define MSG_SETQUOTA 122
@@ -361,30 +362,10 @@ struct CODES {
  { SEVERITY_ERR,   MSG_NOPOOL,	PARAM_NONE,	"No pools" },
 
  { SEVERITY_SUCC,  MSG_DEVS,	PARAM_DMAX,
-#ifdef HAVE_OPENCL
-		 	 	 	 	"%d GPU(s)"
-#endif
-#if defined(HAVE_AN_FPGA) && defined(HAVE_OPENCL)
-						" - "
-#endif
-#ifdef HAVE_AN_FPGA
 						"%d PGA(s)"
-#endif
-#if defined(WANT_CPUMINE) && (defined(HAVE_OPENCL) || defined(HAVE_AN_FPGA))
-						" - "
-#endif
-#ifdef WANT_CPUMINE
-						"%d CPU(s)"
-#endif
  },
 
- { SEVERITY_ERR,   MSG_NODEVS,	PARAM_NONE,	"No GPUs"
-#ifdef HAVE_AN_FPGA
-						"/PGAs"
-#endif
-#ifdef WANT_CPUMINE
-						"/CPUs"
-#endif
+ { SEVERITY_ERR,   MSG_NODEVS,	PARAM_NONE,	"No PGAs"
  },
 
  { SEVERITY_SUCC,  MSG_SUMM,	PARAM_NONE,	"Summary" },
@@ -496,6 +477,7 @@ struct CODES {
  { SEVERITY_SUCC,  MSG_ZERSUM,	PARAM_STR,	"Zeroed %s stats with summary" },
  { SEVERITY_SUCC,  MSG_ZERNOSUM, PARAM_STR,	"Zeroed %s stats without summary" },
  { SEVERITY_SUCC,  MSG_DEVSCAN, PARAM_COUNT,	"Added %d new device(s)" },
+ { SEVERITY_SUCC,  MSG_BYE,		PARAM_STR,	"%s" },
  { SEVERITY_FAIL, 0, 0, NULL }
 };
 
@@ -615,12 +597,6 @@ static bool io_add(struct io_data *io_data, char *buf)
 		io_flush(io_data, false);
 	bytes_append(&io_data->data, buf, len);
 	return true;
-}
-
-static bool io_put(struct io_data *io_data, char *buf)
-{
-	bytes_reset(&io_data->data);
-	return io_add(io_data, buf);
 }
 
 static void io_close(struct io_data *io_data)
@@ -1043,8 +1019,14 @@ static struct api_data *print_data(struct api_data *root, char *buf, bool isjson
 				sprintf(buf, "%.15f", *((double *)(root->data)));
 				break;
 			case API_DIFF:
-				sprintf(buf, "%.8f", *((double *)(root->data)));
+			{
+				const double *fp = root->data;
+				if (fmod(*fp, 1.))
+					sprintf(buf, "%.8f", *fp);
+				else
+					sprintf(buf, "%.0f", *fp);
 				break;
+			}
 			case API_BOOL:
 				sprintf(buf, "%s", *((bool *)(root->data)) ? TRUESTR : FALSESTR);
 				break;
@@ -1213,26 +1195,10 @@ static void message(struct io_data * const io_data, const int messageid2, const 
 					sprintf(buf, codes[i].description, paramid, total_pools - 1);
 					break;
 				case PARAM_DMAX:
-#ifdef HAVE_AN_FPGA
 					pga = numpgas();
-#endif
-#ifdef WANT_CPUMINE
-					if (opt_n_threads > 0)
-						cpu = num_processors;
-					else
-						cpu = 0;
-#endif
 
 					sprintf(buf, codes[i].description
-#ifdef HAVE_OPENCL
-						, nDevs
-#endif
-#ifdef HAVE_AN_FPGA
 						, pga
-#endif
-#ifdef WANT_CPUMINE
-						, cpu
-#endif
 						);
 					break;
 				case PARAM_CMD:
@@ -1292,6 +1258,7 @@ static void apiversion(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __m
 	message(io_data, MSG_VERSION, 0, NULL, isjson);
 	io_open = io_add(io_data, isjson ? COMSTR JSON_VERSION : _VERSION COMSTR);
 
+	root = api_add_string(root, "Miner", PACKAGE " " VERSION, false);
 	root = api_add_string(root, "CGMiner", VERSION, false);
 	root = api_add_const(root, "API", APIVERSION, false);
 
@@ -1309,9 +1276,9 @@ static void minerconfig(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __
 	struct driver_registration *reg, *regtmp;
 	int pgacount = 0;
 	char *adlinuse = (char *)NO;
+	int i;
 #ifdef HAVE_ADL
 	const char *adl = YES;
-	int i;
 
 	for (i = 0; i < nDevs; i++) {
 		struct opencl_device_data * const data = gpus[i].device_data;
@@ -1362,6 +1329,14 @@ static void minerconfig(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __
 #if BLKMAKER_VERSION > 0
 	root = api_add_string(root, "Coinbase-Sig", opt_coinbase_sig, true);
 #endif
+	
+	struct bfg_loaded_configfile *configfile;
+	i = 0;
+	LL_FOREACH(bfg_loaded_configfiles, configfile)
+	{
+		snprintf(buf, sizeof(buf), "ConfigFile%d", i++);
+		root = api_add_string(root, buf, configfile->filename, false);
+	}
 
 	root = print_data(root, buf, isjson, false);
 	io_add(io_data, buf);
@@ -1412,15 +1387,20 @@ struct api_data *api_add_device_identifier(struct api_data *root, struct cgpu_in
 static
 int find_index_by_cgpu(struct cgpu_info *cgpu)
 {
+	if (per_proc)
+		return cgpu->cgminer_id;
+	
 	int n = 0, i;
 	
+	// Quickly traverse the devices array backward until we reach the 0th device, counting as we go
 	rd_lock(&devices_lock);
-	for (i = 0; i < total_devices; ++i)
+	while (true)
 	{
-		if (devices[i] == cgpu)
+		i = cgpu->device->cgminer_id;
+		if (!i)
 			break;
-		if (devices[i]->device != devices[i] && !per_proc)
-			continue;
+		cgpu = devices[--i];
+		++n;
 	}
 	rd_unlock(&devices_lock);
 	return n;
@@ -1457,7 +1437,7 @@ static void devdetail_an(struct io_data *io_data, struct cgpu_info *cgpu, bool i
 	root = api_add_int(root, "Target Temperature", &cgpu->targettemp, false);
 	root = api_add_int(root, "Cutoff Temperature", &cgpu->cutofftemp, false);
 
-	if (cgpu->drv->get_api_extra_device_detail)
+	if ((per_proc || cgpu->procs <= 1) && cgpu->drv->get_api_extra_device_detail)
 		root = api_add_extra(root, cgpu->drv->get_api_extra_device_detail(cgpu));
 
 	root = print_data(root, buf, isjson, precom);
@@ -1532,6 +1512,7 @@ void devstatus_an(struct io_data *io_data, struct cgpu_info *cgpu, bool isjson, 
 	char mhsname[27];
 	sprintf(mhsname, "MHS %ds", opt_log_interval);
 	root = api_add_mhs(root, mhsname, &rolling, false);
+	root = api_add_mhs(root, "MHS rolling", &rolling, false);
 	root = api_add_int(root, "Accepted", &accepted, false);
 	root = api_add_int(root, "Rejected", &rejected, false);
 	root = api_add_int(root, "Hardware Errors", &hw_errors, false);
@@ -1856,7 +1837,8 @@ static void cpudev(struct io_data *io_data, __maybe_unused SOCKETTYPE c, char *p
 	bool io_open = false;
 	int id;
 
-	if (opt_n_threads == 0) {
+	if (opt_n_threads <= 0)
+	{
 		message(io_data, MSG_CPUNON, 0, NULL, isjson);
 		return;
 	}
@@ -1919,6 +1901,9 @@ static void poolstatus(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __m
 				if (pool->idle)
 					status = (char *)DEAD;
 				else
+				if (pool->failover_only)
+					status = "Failover";
+				else
 					status = (char *)ALIVE;
 				break;
 			default:
@@ -1963,7 +1948,7 @@ static void poolstatus(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __m
 			root = api_add_escape(root, "Stratum URL", pool->stratum_url, false);
 		else
 			root = api_add_const(root, "Stratum URL", BLANK, false);
-		root = api_add_uint64(root, "Best Share", &(pool->best_diff), true);
+		root = api_add_diff(root, "Best Share", &(pool->best_diff), true);
 		if (pool->admin_msg)
 			root = api_add_escape(root, "Message", pool->admin_msg, true);
 		double rejp = (pool->diff_accepted + pool->diff_rejected + pool->diff_stale) ?
@@ -2006,7 +1991,7 @@ static void summary(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __mayb
 
 	root = api_add_elapsed(root, "Elapsed", &(total_secs), true);
 #ifdef WANT_CPUMINE
-	if (opt_n_threads)
+	if (opt_n_threads > 0)
 	root = api_add_string(root, "Algorithm", algo, false);
 #endif
 	root = api_add_mhs(root, "MHS av", &(mhs), false);
@@ -2031,7 +2016,7 @@ static void summary(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __mayb
 	root = api_add_diff(root, "Difficulty Accepted", &(total_diff_accepted), true);
 	root = api_add_diff(root, "Difficulty Rejected", &(total_diff_rejected), true);
 	root = api_add_diff(root, "Difficulty Stale", &(total_diff_stale), true);
-	root = api_add_uint64(root, "Best Share", &(best_diff), true);
+	root = api_add_diff(root, "Best Share", &(best_diff), true);
 	double hwp = (total_bad_diff1 + total_diff1) ?
 			(double)(total_bad_diff1) / (double)(total_bad_diff1 + total_diff1) : 0;
 	root = api_add_percent(root, "Device Hardware%", &hwp, false);
@@ -2201,7 +2186,8 @@ static void cpuenable(struct io_data *io_data, __maybe_unused SOCKETTYPE c, char
 {
 	int id;
 
-	if (opt_n_threads == 0) {
+	if (opt_n_threads <= 0)
+	{
 		message(io_data, MSG_CPUNON, 0, NULL, isjson);
 		return;
 	}
@@ -2239,7 +2225,8 @@ static void cpudisable(struct io_data *io_data, __maybe_unused SOCKETTYPE c, cha
 {
 	int id;
 
-	if (opt_n_threads == 0) {
+	if (opt_n_threads <= 0)
+	{
 		message(io_data, MSG_CPUNON, 0, NULL, isjson);
 		return;
 	}
@@ -2272,7 +2259,8 @@ static void cpurestart(struct io_data *io_data, __maybe_unused SOCKETTYPE c, cha
 {
 	int id;
 
-	if (opt_n_threads == 0) {
+	if (opt_n_threads <= 0)
+	{
 		message(io_data, MSG_CPUNON, 0, NULL, isjson);
 		return;
 	}
@@ -2340,6 +2328,7 @@ static void switchpool(struct io_data *io_data, __maybe_unused SOCKETTYPE c, cha
 	}
 
 	pool = pools[id];
+	pool->failover_only = false;
 	pool->enabled = POOL_ENABLED;
 	cg_runlock(&control_lock);
 	switch_pools(pool);
@@ -2453,11 +2442,12 @@ static void enablepool(struct io_data *io_data, __maybe_unused SOCKETTYPE c, cha
 	}
 
 	pool = pools[id];
-	if (pool->enabled == POOL_ENABLED) {
+	if (pool->enabled == POOL_ENABLED && !pool->failover_only) {
 		message(io_data, MSG_ALRENAP, id, NULL, isjson);
 		return;
 	}
 
+	pool->failover_only = false;
 	pool->enabled = POOL_ENABLED;
 	if (pool->prio < current_pool()->prio)
 		switch_pools(pool);
@@ -2783,10 +2773,7 @@ static void gpuvddc(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __mayb
 
 void doquit(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __maybe_unused char *param, bool isjson, __maybe_unused char group)
 {
-	if (isjson)
-		io_put(io_data, JSON_START JSON_BYE);
-	else
-		io_put(io_data, _BYE);
+	message(io_data, MSG_BYE, 0, _BYE, isjson);
 
 	bye = true;
 	do_a_quit = true;
@@ -2794,10 +2781,7 @@ void doquit(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __maybe_unused
 
 void dorestart(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __maybe_unused char *param, bool isjson, __maybe_unused char group)
 {
-	if (isjson)
-		io_put(io_data, JSON_START JSON_RESTART);
-	else
-		io_put(io_data, _RESTART);
+	message(io_data, MSG_BYE, 0, _RESTART, isjson);
 
 	bye = true;
 	do_a_restart = true;
@@ -3547,6 +3531,25 @@ static void send_result(struct io_data *io_data, SOCKETTYPE c, bool isjson)
 		       (long)bytes_len(&io_data->data));
 }
 
+static
+void _tidyup_socket(SOCKETTYPE * const sockp)
+{
+	if (*sockp != INVSOCK) {
+		shutdown(*sockp, SHUT_RDWR);
+		CLOSESOCKET(*sockp);
+		*sockp = INVSOCK;
+		free(sockp);
+	}
+}
+
+static
+void tidyup_socket(void * const arg)
+{
+	mutex_lock(&quit_restart_lock);
+	_tidyup_socket(arg);
+	mutex_unlock(&quit_restart_lock);
+}
+
 static void tidyup(__maybe_unused void *arg)
 {
 	mutex_lock(&quit_restart_lock);
@@ -3555,12 +3558,7 @@ static void tidyup(__maybe_unused void *arg)
 
 	bye = true;
 
-	if (*apisock != INVSOCK) {
-		shutdown(*apisock, SHUT_RDWR);
-		CLOSESOCKET(*apisock);
-		*apisock = INVSOCK;
-		free(apisock);
-	}
+	_tidyup_socket(apisock);
 
 	if (ipaccess != NULL) {
 		free(ipaccess);
@@ -3874,9 +3872,9 @@ static void mcast()
 	struct sockaddr_in listen;
 	struct ip_mreq grp;
 	struct sockaddr_in came_from;
-	time_t bindstart;
+	struct timeval bindstart;
 	const char *binderror;
-	SOCKETTYPE mcast_sock;
+	SOCKETTYPE *mcastsock;
 	SOCKETTYPE reply_sock;
 	socklen_t came_from_siz;
 	char *connectaddr;
@@ -3899,10 +3897,14 @@ static void mcast()
 		quit(1, "Invalid Multicast Address");
 	grp.imr_interface.s_addr = INADDR_ANY;
 
-	mcast_sock = socket(AF_INET, SOCK_DGRAM, 0);
-
+	mcastsock = malloc(sizeof(*mcastsock));
+	*mcastsock = INVSOCK;
+	pthread_cleanup_push(tidyup_socket, mcastsock);
+	
+	*mcastsock = bfg_socket(AF_INET, SOCK_DGRAM, 0);
+	
 	int optval = 1;
-	if (SOCKETFAIL(setsockopt(mcast_sock, SOL_SOCKET, SO_REUSEADDR, (void *)(&optval), sizeof(optval)))) {
+	if (SOCKETFAIL(setsockopt(*mcastsock, SOL_SOCKET, SO_REUSEADDR, (void *)(&optval), sizeof(optval)))) {
 		applog(LOG_ERR, "API mcast setsockopt SO_REUSEADDR failed (%s)%s", SOCKERRMSG, MUNAVAILABLE);
 		goto die;
 	}
@@ -3914,11 +3916,11 @@ static void mcast()
 
 	// try for more than 1 minute ... in case the old one hasn't completely gone yet
 	bound = 0;
-	bindstart = time(NULL);
+	timer_set_now(&bindstart);
 	while (bound == 0) {
-		if (SOCKETFAIL(bind(mcast_sock, (struct sockaddr *)(&listen), sizeof(listen)))) {
+		if (SOCKETFAIL(bind(*mcastsock, (struct sockaddr *)(&listen), sizeof(listen)))) {
 			binderror = SOCKERRMSG;
-			if ((time(NULL) - bindstart) > 61)
+			if (timer_elapsed(&bindstart, NULL) > 61)
 				break;
 			else
 				cgsleep_ms(30000);
@@ -3931,7 +3933,7 @@ static void mcast()
 		goto die;
 	}
 
-	if (SOCKETFAIL(setsockopt(mcast_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)(&grp), sizeof(grp)))) {
+	if (SOCKETFAIL(setsockopt(*mcastsock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)(&grp), sizeof(grp)))) {
 		applog(LOG_ERR, "API mcast join failed (%s)%s", SOCKERRMSG, MUNAVAILABLE);
 		goto die;
 	}
@@ -3948,10 +3950,10 @@ static void mcast()
 
 		count++;
 		came_from_siz = sizeof(came_from);
-		if (SOCKETFAIL(rep = recvfrom(mcast_sock, buf, sizeof(buf) - 1,
+		if (SOCKETFAIL(rep = recvfrom(*mcastsock, buf, sizeof(buf) - 1,
 						0, (struct sockaddr *)(&came_from), &came_from_siz))) {
 			applog(LOG_DEBUG, "API mcast failed count=%d (%s) (%d)",
-					count, SOCKERRMSG, (int)mcast_sock);
+					count, SOCKERRMSG, (int)*mcastsock);
 			continue;
 		}
 
@@ -3980,7 +3982,7 @@ static void mcast()
 							&buf[expect_code_len], reply_port);
 
 				came_from.sin_port = htons(reply_port);
-				reply_sock = socket(AF_INET, SOCK_DGRAM, 0);
+				reply_sock = bfg_socket(AF_INET, SOCK_DGRAM, 0);
 
 				snprintf(replybuf, sizeof(replybuf),
 							"cgm-%s-%d-%s",
@@ -3998,6 +4000,7 @@ static void mcast()
 								replybuf, (int)rep, (int)reply_sock);
 				}
 
+				shutdown(reply_sock, SHUT_RDWR);
 				CLOSESOCKET(reply_sock);
 			}
 		} else
@@ -4005,8 +4008,8 @@ static void mcast()
 	}
 
 die:
-
-	CLOSESOCKET(mcast_sock);
+	;  // statement in case pthread_cleanup_pop doesn't start with one
+	pthread_cleanup_pop(true);
 }
 
 static void *mcast_thread(void *userdata)
@@ -4085,16 +4088,16 @@ void api(int api_thr_id)
 
 		if (ips == 0) {
 			applog(LOG_WARNING, "API not running (no valid IPs specified)%s", UNAVAILABLE);
-			return;
+			pthread_exit(NULL);
 		}
 	}
 
-	*apisock = socket(AF_INET, SOCK_STREAM, 0);
+	*apisock = bfg_socket(AF_INET, SOCK_STREAM, 0);
 	if (*apisock == INVSOCK) {
 		applog(LOG_ERR, "API1 initialisation failed (%s)%s", SOCKERRMSG, UNAVAILABLE);
-		return;
+		pthread_exit(NULL);
 	}
-
+	
 	memset(&serv, 0, sizeof(serv));
 
 	serv.sin_family = AF_INET;
@@ -4103,7 +4106,7 @@ void api(int api_thr_id)
 		serv.sin_addr.s_addr = inet_addr(localaddr);
 		if (serv.sin_addr.s_addr == (in_addr_t)INVINETADDR) {
 			applog(LOG_ERR, "API2 initialisation failed (%s)%s", SOCKERRMSG, UNAVAILABLE);
-			return;
+			pthread_exit(NULL);
 		}
 	}
 
@@ -4141,13 +4144,12 @@ void api(int api_thr_id)
 
 	if (bound == 0) {
 		applog(LOG_ERR, "API bind to port %d failed (%s)%s", port, binderror, UNAVAILABLE);
-		return;
+		pthread_exit(NULL);
 	}
 
 	if (SOCKETFAIL(listen(*apisock, QUEUE))) {
 		applog(LOG_ERR, "API3 initialisation failed (%s)%s", SOCKERRMSG, UNAVAILABLE);
-		CLOSESOCKET(*apisock);
-		return;
+		pthread_exit(NULL);
 	}
 
 	if (opt_api_allow)
@@ -4256,8 +4258,8 @@ void api(int api_thr_id)
 				if (!did) {
 					if (strchr(cmd, CMDJOIN)) {
 						firstjoin = isjoin = true;
-						// cmd + leading '|' + '\0'
-						cmdsbuf = malloc(strlen(cmd) + 2);
+						// cmd + leading+tailing '|' + '\0'
+						cmdsbuf = malloc(strlen(cmd) + 3);
 						if (!cmdsbuf)
 							quithere(1, "OOM cmdsbuf");
 						strcpy(cmdsbuf, "|");
@@ -4334,6 +4336,7 @@ inochi:
 					send_result(io_data, c, isjson);
 			}
 		}
+		shutdown(c, SHUT_RDWR);
 		CLOSESOCKET(c);
 	}
 die:

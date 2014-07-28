@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2013 Luke Dashjr
+ * Copyright 2012-2014 Luke Dashjr
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -14,7 +14,7 @@
 
 #include "compat.h"
 #include "dynclock.h"
-#include "icarus-common.h"
+#include "driver-icarus.h"
 #include "lowlevel.h"
 #include "lowl-vcom.h"
 #include "miner.h"

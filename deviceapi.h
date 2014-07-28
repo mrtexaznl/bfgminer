@@ -97,24 +97,11 @@ typedef bool(*detectone_func_t)(const char*);
 typedef int(*autoscan_func_t)();
 
 enum generic_detect_flags {
-	GDF_FORCE_AUTO = 1,
 	GDF_REQUIRE_DNAME = 2,
 	GDF_DEFAULT_NOAUTO = 4,
 };
 
 extern int _serial_detect(struct device_drv *api, detectone_func_t, autoscan_func_t, int flags);
-#define serial_detect_fauto(api, detectone, autoscan)  \
-	_serial_detect(api, detectone, autoscan, 1)
-#define serial_detect_auto(api, detectone, autoscan)  \
-	_serial_detect(api, detectone, autoscan, 0)
-#define serial_detect_auto_byname(api, detectone, autoscan)  \
-	_serial_detect(api, detectone, autoscan, 2)
-#define serial_detect(api, detectone)  \
-	_serial_detect(api, detectone,     NULL, 0)
-#define serial_detect_byname(api, detectone)  \
-	_serial_detect(api, detectone,     NULL, 2)
-#define noserial_detect(api, autoscan)  \
-	_serial_detect(api, NULL     , autoscan, 0)
 #define noserial_detect_manual(api, autoscan)  \
 	_serial_detect(api, NULL     , autoscan, 4)
 #define generic_detect(drv, detectone, autoscan, flags)  _serial_detect(drv, detectone, autoscan, flags)
@@ -122,5 +109,11 @@ extern int _serial_detect(struct device_drv *api, detectone_func_t, autoscan_fun
 extern FILE *open_bitstream(const char *dname, const char *filename);
 
 extern void close_device_fd(struct thr_info *);
+
+#define for_each_managed_proc(procvar, dev)  \
+	for (struct cgpu_info *procvar = dev; procvar; procvar = procvar->next_proc)
+#define for_each_logical_proc(procvar, dev)  \
+	for (struct cgpu_info *procvar = dev; procvar && procvar->device == (dev); procvar = procvar->next_proc)
+extern struct cgpu_info *device_proc_by_id(const struct cgpu_info *dev, int procid);
 
 #endif

@@ -63,16 +63,23 @@ typedef struct {
 	uint32_t nonce;
 } dev_blk_ctx;
 
+struct ntime_roll_limits {
+	uint32_t min;
+	uint32_t max;
+	uint16_t minoff;
+	uint16_t maxoff;
+};
+
 struct work {
 	unsigned char	data[128];
 	unsigned char	midstate[32];
 	unsigned char	target[32];
 	unsigned char	hash[32];
 
-	uint64_t	share_diff;
+	double	share_diff;
 
 	int		rolls;
-	int		drv_rolllimit; /* How much the driver can roll ntime */
+	//int		drv_rolllimit; /* How much the driver can roll ntime */
 
 	struct {
 		uint32_t nonce;

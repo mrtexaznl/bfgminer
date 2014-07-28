@@ -7,12 +7,16 @@
 
 #include <uthash.h>
 
+#include "miner.h"
+
 struct lowlevel_device_info;
 
 typedef bool (*lowl_found_devinfo_func_t)(struct lowlevel_device_info *, void *);
 
 struct lowlevel_driver {
 	const char *dname;
+	bool exclude_from_all;
+	
 	struct lowlevel_device_info *(*devinfo_scan)();
 	void (*devinfo_free)(struct lowlevel_device_info *);
 };
@@ -57,7 +61,7 @@ extern struct lowlevel_device_info *lowlevel_ref(const struct lowlevel_device_in
 extern void lowlevel_devinfo_semicpy(struct lowlevel_device_info *dst, const struct lowlevel_device_info *src);
 extern void lowlevel_devinfo_free(struct lowlevel_device_info *);
 
-#ifdef USE_X6500
+#ifdef NEED_BFG_LOWL_FTDI
 extern struct lowlevel_driver lowl_ft232r;
 #endif
 #ifdef NEED_BFG_LOWL_HID
@@ -66,6 +70,9 @@ extern struct lowlevel_driver lowl_hid;
 #ifdef USE_NANOFURY
 extern struct lowlevel_driver lowl_mcp2210;
 #endif
+#ifdef NEED_BFG_LOWL_MSWIN
+extern struct lowlevel_driver lowl_mswin;
+#endif
 #ifdef NEED_BFG_LOWL_PCI
 extern struct lowlevel_driver lowl_pci;
 #endif
@@ -73,7 +80,7 @@ extern struct lowlevel_driver lowl_pci;
 extern struct lowlevel_driver lowl_usb;
 #else
 // Dummy definition for the various "don't warn if just a lower-level interface" checks
-static struct lowlevel_driver lowl_usb;
+static __maybe_unused struct lowlevel_driver lowl_usb;
 #endif
 #ifdef NEED_BFG_LOWL_VCOM
 extern struct lowlevel_driver lowl_vcom;

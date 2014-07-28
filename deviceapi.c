@@ -1,8 +1,9 @@
 /*
- * Copyright 2011-2013 Luke Dashjr
+ * Copyright 2011-2014 Luke Dashjr
  * Copyright 2011-2012 Con Kolivas
  * Copyright 2012-2013 Andrew Smith
  * Copyright 2010 Jeff Garzik
+ * Copyright 2014 Nate Woolls
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -239,7 +240,11 @@ void minerloop_scanhash(struct thr_info *mythr)
 			* it is not in the driver code. */
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 			timer_set_now(&tv_start);
+
+			/* api->scanhash should scan the work for valid nonces
+			 * until max_nonce is reached or thr_info->work_restart */
 			hashes = api->scanhash(mythr, work, work->blk.nonce + max_nonce);
+
 			timer_set_now(&tv_end);
 			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 			pthread_testcancel();
@@ -269,6 +274,10 @@ disabled:
 				mt_disable(mythr);
 			
 			timersub(&tv_end, &work->tv_work_start, &tv_worktime);
+
+		/* The inner do-while loop will exit unless the device is capable of
+		 * scanning a specific nonce range (currently CPU and GPU drivers)
+		 * See abandon_work comments for more details */
 		} while (!abandon_work(work, &tv_worktime, cgpu->max_hashes));
 		free_work(work);
 	}
@@ -689,6 +698,9 @@ redo:
 			reduce_timeout_to(&tv_timeout, &mythr->tv_watchdog);
 		}
 		
+		// HACK: Some designs set the main thr tv_poll from secondary thrs
+		reduce_timeout_to(&tv_timeout, &cgpu->thr[0]->tv_poll);
+		
 		do_notifier_select(thr, &tv_timeout);
 	}
 }
@@ -754,18 +766,13 @@ bool _add_cgpu(struct cgpu_info *cgpu)
 {
 	int lpcount;
 	
-	renumber_cgpu(cgpu);
 	if (!cgpu->procs)
 		cgpu->procs = 1;
 	lpcount = cgpu->procs;
 	cgpu->device = cgpu;
 	
 	cgpu->dev_repr = malloc(6);
-	sprintf(cgpu->dev_repr, "%s%2u", cgpu->drv->name, cgpu->device_id % 100);
 	cgpu->dev_repr_ns = malloc(6);
-	sprintf(cgpu->dev_repr_ns, "%s%u", cgpu->drv->name, cgpu->device_id % 100);
-	strcpy(cgpu->proc_repr, cgpu->dev_repr);
-	sprintf(cgpu->proc_repr_ns, "%s%u", cgpu->drv->name, cgpu->device_id);
 	
 #ifdef NEED_BFG_LOWL_VCOM
 	maybe_strdup_if_null(&cgpu->dev_manufacturer, detectone_meta_info.manufacturer);
@@ -778,17 +785,8 @@ bool _add_cgpu(struct cgpu_info *cgpu)
 	
 	if (lpcount > 1)
 	{
-		int ns;
 		int tpp = cgpu->threads / lpcount;
 		struct cgpu_info **nlp_p, *slave;
-		int lpdigits = 1;
-		for (int i = lpcount; i > 26 && lpdigits < 3; i /= 26)
-			++lpdigits;
-		
-		memset(&cgpu->proc_repr[5], 'a', lpdigits);
-		cgpu->proc_repr[5 + lpdigits] = '\0';
-		ns = strlen(cgpu->proc_repr_ns);
-		strcpy(&cgpu->proc_repr_ns[ns], &cgpu->proc_repr[5]);
 		
 		nlp_p = &cgpu->next_proc;
 		for (int i = 1; i < lpcount; ++i)
@@ -796,11 +794,6 @@ bool _add_cgpu(struct cgpu_info *cgpu)
 			slave = malloc(sizeof(*slave));
 			*slave = *cgpu;
 			slave->proc_id = i;
-			for (int x = i, y = lpdigits; --y, x; x /= 26)
-			{
-				slave->proc_repr_ns[ns + y] =
-				slave->proc_repr[5 + y] += (x % 26);
-			}
 			slave->threads = tpp;
 			devices_new[total_devices_new++] = slave;
 			*nlp_p = slave;
@@ -811,6 +804,7 @@ bool _add_cgpu(struct cgpu_info *cgpu)
 		cgpu->threads -= (tpp * (lpcount - 1));
 	}
 
+	renumber_cgpu(cgpu);
 	cgpu->last_device_valid_work = time(NULL);
 	
 	return true;
@@ -984,6 +978,7 @@ bool _serial_detect_all(struct lowlevel_device_info * const info, void * const u
 }
 #endif
 
+// NOTE: This is never used for any actual VCOM devices, which should use the new lowlevel interface
 int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_func_t autoscan, int flags)
 {
 	struct string_elist *iter, *tmp;
@@ -992,7 +987,6 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 	char found = 0;
 	bool forceauto = flags & 1;
 	bool hasname;
-	bool doall = false;
 	size_t namel = strlen(api->name);
 	size_t dnamel = strlen(api->dname);
 
@@ -1026,25 +1020,12 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 		{}  // do nothing
 		else
 		if (!strcmp(dev, "all"))
-			doall = true;
-#ifdef NEED_BFG_LOWL_VCOM
-		else
-		if (serial_claim(dev, NULL))
-		{
-			applog(LOG_DEBUG, "%s is already claimed... skipping probes", dev);
-			string_elist_del(&scan_devices, iter);
-		}
-#endif
+		{}  // n/a
 		else if (detectone(dev)) {
 			string_elist_del(&scan_devices, iter);
 			++found;
 		}
 	}
-
-#ifdef NEED_BFG_LOWL_VCOM
-	if (doall && detectone)
-		found += lowlevel_detect_id(_serial_detect_all, detectone, &lowl_vcom, 0, 0);
-#endif
 	
 	if ((forceauto || !(inhibitauto || found)) && autoscan)
 		found += autoscan();
@@ -1113,4 +1094,17 @@ void close_device_fd(struct thr_info * const thr)
 		proc->device_fd = -1;
 		applog(LOG_DEBUG, "%"PRIpreprv": Closed device fd", proc->proc_repr);
 	}
+}
+
+
+struct cgpu_info *device_proc_by_id(const struct cgpu_info * const dev, const int procid)
+{
+	struct cgpu_info *proc = (void*)dev;
+	for (int i = 0; i < procid; ++i)
+	{
+		proc = proc->next_proc;
+		if (unlikely((!proc) || proc->device != dev))
+			return NULL;
+	}
+	return proc;
 }

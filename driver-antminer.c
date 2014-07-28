@@ -1,6 +1,6 @@
 /*
- * Copyright 2013 Luke Dashjr
- * Copyright 2013 Nate Woolls
+ * Copyright 2013-2014 Luke Dashjr
+ * Copyright 2013-2014 Nate Woolls
  * Copyright 2013 Lingchao Xu
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -19,7 +19,7 @@
 #include <strings.h>
 
 #include "miner.h"
-#include "icarus-common.h"
+#include "driver-icarus.h"
 #include "lowlevel.h"
 #include "lowl-vcom.h"
 #include "deviceapi.h"
@@ -135,7 +135,7 @@ char *antminer_set_clock(struct cgpu_info *cgpu, char *setting, char *replybuf)
 	
 	if (!hex2bin(reg_data, hex_setting, strlen(hex_setting) / 2))
 	{
-		sprintf(replybuf, "invalid clock: '%s' data must be a hexidecimal value", hex_setting);
+		sprintf(replybuf, "invalid clock: '%s' data must be a hexadecimal value", hex_setting);
 		return replybuf;
 	}
 	

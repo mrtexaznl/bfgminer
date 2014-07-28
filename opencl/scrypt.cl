@@ -1,6 +1,9 @@
 /*-
- * Copyright 2009 Colin Percival, 2011 ArtForz, 2011 pooler, 2012 mtrlt,
- * 2012-2013 Con Kolivas.
+ * Copyright 2009 Colin Percival
+ * Copyright 2011 ArtForz
+ * Copyright 2011 pooler
+ * Copyright 2012 mtrlt
+ * Copyright 2012-2013 Con Kolivas
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,6 +30,8 @@
  * This file was originally written by Colin Percival as part of the Tarsnap
  * online backup system.
  */
+
+// kernel-interface: scrypt
 
 __constant uint ES[2] = { 0x00FF00FF, 0xFF00FF00 };
 __constant uint K[] = {

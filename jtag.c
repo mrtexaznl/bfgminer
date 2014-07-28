@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Luke Dashjr
+ * Copyright 2012-2013 Luke Dashjr
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "ft232r.h"
+#include "lowl-ftdi.h"
 #include "jtag.h"
 #include "logging.h"
 #include "miner.h"

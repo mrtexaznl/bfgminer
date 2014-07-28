@@ -3,7 +3,7 @@ SUPPORTED DEVICES
 Currently supported ASIC devices include Avalon, Bitfountain's Block Erupter
 series (both USB and blades), a large variety of Bitfury-based miners,
 Butterfly Labs' SC range of devices, HashBuster boards, Klondike modules, and
-KnCminer's Mercury, Jupiter and Saturn.
+KnCMiner's Mercury, Jupiter and Saturn.
 
 
 AVALON
@@ -123,6 +123,19 @@ ports. They communicate with the Icarus protocol, which has some additional
 options in README.FPGA
 
 
+HEX*FURY
+--------
+
+Hex*Fury uses the bifury driver. Miners using earlier boards may need to
+workaround bugs in the firmware:
+    bfgminer --set bifury:chips=6 --set bifury:free_after_job=no
+This may cause poor behaviour or performance from other bifury-based devices.
+If you encounter this, you can set the workarounds per-device by using their
+serial number (which can be seen in the TUI device manager; in this example,
+141407160211cdf):
+    bfgminer --set bifury@141407160211cdf:chips=15 ...
+
+
 KLONDIKE
 --------
 
@@ -132,16 +145,18 @@ KLONDIKE
 KNCMINER
 --------
 
-The KnC miner uses a BeagleBoneBlack(BBB) as the host, this is pluged into a
-cape that holds the FPGA and connections for 4-6 ASICS depending on the cape
-version. The BBB runs the Angstrom linux distribution, the following is a step
-by step install for BFGMiner on this distro;
+KnCMiner rigs use a BeagleBone Black (BBB) as the host; this is pluged into a
+"cape" with a FPGA and connections for 4-6 ASIC modules (depending on the cape
+version). Note that in addition to the usual dependencies, this driver also
+requires i2c-tools (aka libi2c-dev on some systems). The BBB comes with the
+Ångström Distribution by default. The following is a step by step install for
+BFGMiner on this system;
 
 -----------------Start------------
 cat >/etc/opkg/feeds.conf <<\EOF
 src/gz noarch http://feeds.angstrom-distribution.org/feeds/v2013.06/ipk/eglibc/all/
-src/gz base http://feeds.angstrom-distribution.org/feeds/v2013.06/ipk/eglibc/cortexa8hf-vfp-neon/base/
-src/gz beaglebone http://feeds.angstrom-distribution.org/feeds/v2013.06/ipk/eglibc/cortexa8hf-vfp-neon/machine/beaglebone/
+src/gz base http://feeds.angstrom-distribution.org/feeds/v2013.06/ipk/eglibc/armv7ahf-vfp-neon/base/
+src/gz beaglebone http://feeds.angstrom-distribution.org/feeds/v2013.06/ipk/eglibc/armv7ahf-vfp-neon/machine/beaglebone/
 EOF
 
 opkg update
@@ -152,7 +167,6 @@ opkg update
 opkg install update-alternatives
 opkg install automake autoconf make gcc cpp binutils git less pkgconfig-dev ncurses-dev libtool nano bash i2c-tools-dev
 while ! opkg install libcurl-dev; do true; done
-ln -s aclocal-1.12 /usr/share/aclocal
 
 curl http://www.digip.org/jansson/releases/jansson-2.0.1.tar.bz2 | tar -xjvp
 cd jansson-2.0.1
@@ -164,15 +178,13 @@ git clone git://github.com/luke-jr/bfgminer
 cd bfgminer
 ./autogen.sh
 git clone git://github.com/troydhanson/uthash
-./configure --host=arm-angstrom-linux-gnueabi --enable-knc CFLAGS="-I$PWD/uthash/src -O0 -ggdb"
+./configure --host=arm-angstrom-linux-gnueabi --enable-knc --disable-other-drivers CFLAGS="-I$PWD/uthash/src"
 make AR=arm-angstrom-linux-gnueabi-ar
 
 /etc/init.d/cgminer.sh stop
 ./bfgminer -S knc:auto -c /config/cgminer.conf
 
 ---------------END-------------
-
-BFGMiner has also been incorporated into an unofficial firmware by uski01 called Bertmod this can be found on the kncminer forum.
 
 
 MONARCH
@@ -188,24 +200,41 @@ To enable uio on your cards, you may need to do:
     sudo modprobe uio_pci_generic
     echo 1cf9 0001 | sudo tee /sys/bus/pci/drivers/uio_pci_generic/new_id
 
-Enabling vfio is similar, but more complicated, but allows you to run BFGMiner
-without root privileges. First, load the kernel module and tell it to accept the
-Monarch:
+Enabling vfio is similar, but allows you to run BFGMiner without root
+privileges. Since setting this up is more complicated, BFGMiner includes a
+setup-vfio script (which must be run with root permissions). Simply run:
+    sudo setup-vfio --unsafe --user $(whoami) 1cf9 0001
+You will be asked about each Monarch found, and must answer 'yes' to each one.
+
+If you wish to manually setup VFIO, follow these steps:
+First, load the kernel module:
     sudo modprobe vfio-pci
-    echo 1cf9 0001 | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
 Next, identify what the device ids are for your card(s):
     lspci -D | grep 1cf9  # the first number of each line is the device id
 From that, you can identify its IOMMU group, and list all devices sharing that
 group:
-    readlink /sys/bus/pci/devices/<device_id>/iommu_group
-    ls /sys/kernel/iommu_groups/<iommu_group>/devices/
+    readlink "/sys/bus/pci/devices/$DEVICE_ID/iommu_group"
+    ls "/sys/kernel/iommu_groups/$IOMMU_GROUP_ID/devices/"
 All of the devices listed (other than the Monarch), if any, will need to be
 disabled and unbound! To do that, use:
-    echo <device_id> | sudo tee /sys/bus/pci/devices/<device_id>/driver/unbind
+    echo "$DEVICE_ID" | sudo tee "/sys/bus/pci/devices/$DEVICE_ID/driver/unbind"
+    echo "$DEVICE_CODE" | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
+Note that $DEVICE_ID should be something like "0000:01:00.0" and $DEVICE_CODE is
+something like "1cf9 0001" (this example is the Monarch itself).
 If you want to run BFGMiner as a normal user:
-    chown <username> /dev/vfio/<iommu_group>
+    chown "$USERNAME" "/dev/vfio/$IOMMU_GROUP_ID"
 Depending on your system, you may also need to do:
     echo 1 | sudo tee /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
+
+
+ONESTRINGMINER
+--------------
+
+OneStringMiner boards use the bifury driver. Miners using earlier boards may
+need to workaround bugs in the firmware:
+    bfgminer --set bifury:chips=15 --set bifury:free_after_job=no
+If you have different devices using the bifury driver, see the section on
+Hex*Fury for applying workarounds per-device.
 
 
 ---

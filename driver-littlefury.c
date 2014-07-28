@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Luke Dashjr
+ * Copyright 2013-2014 Luke Dashjr
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -19,9 +19,9 @@
 #include "libbitfury.h"
 #include "logging.h"
 #include "lowlevel.h"
+#include "lowl-spi.h"
 #include "lowl-vcom.h"
 #include "miner.h"
-#include "spidevc.h"
 #include "util.h"
 
 
@@ -270,7 +270,7 @@ bool littlefury_detect_one(const char *devpath)
 	uint8_t buf[255];
 	uint16_t bufsz;
 	struct cgpu_info dummy;
-	char *devname;
+	char *devname = NULL;
 	
 	fd = serial_open(devpath, 0, 10, true);
 	applog(LOG_DEBUG, "%s: %s %s",
@@ -309,7 +309,6 @@ bool littlefury_detect_one(const char *devpath)
 	if (!chips) {
 		applog(LOG_WARNING, "%s: No Bitfury chips detected on %s",
 		       littlefury_drv.dname, devpath);
-		free(devname);
 		goto err;
 	} else {
 		applog(LOG_DEBUG, "%s: %d chips detected",
@@ -318,10 +317,10 @@ bool littlefury_detect_one(const char *devpath)
 	
 	littlefury_set_power(LOG_DEBUG, littlefury_drv.dname, fd, false);
 	
-	serial_close(fd);
-	
 	if (serial_claim_v(devpath, &littlefury_drv))
-		return false;
+		goto err;
+	
+	serial_close(fd);
 	
 	struct cgpu_info *cgpu;
 	cgpu = malloc(sizeof(*cgpu));
@@ -343,6 +342,7 @@ bool littlefury_detect_one(const char *devpath)
 err:
 	if (fd != -1)
 		serial_close(fd);
+	free(devname);
 	return false;
 }
 
@@ -365,7 +365,7 @@ bool littlefury_thread_init(struct thr_info *thr)
 	{
 		spi = malloc(sizeof(*spi));
 		
-		/* Be careful, read spidevc.h comments for warnings */
+		/* Be careful, read lowl-spi.h comments for warnings */
 		memset(spi, 0, sizeof(*spi));
 		spi->txrx = littlefury_txrx;
 		spi->cgpu = proc;

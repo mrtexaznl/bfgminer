@@ -1,9 +1,11 @@
 /*
- * Copyright 2011-2013 Con Kolivas
- * Copyright 2011-2013 Luke Dashjr
- * Copyright 2010 Jeff Garzik
+ * Copyright 2011-2014 Con Kolivas
+ * Copyright 2011-2014 Luke Dashjr
+ * Copyright 2014 Nate Woolls
+ * Copyright 2010-2011 Jeff Garzik
  * Copyright 2012 Giel van Schijndel
  * Copyright 2012 Gavin Andresen
+ * Copyright 2013 Lingchao Xu
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -13,6 +15,7 @@
 
 #include "config.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -58,6 +61,7 @@
 #include "miner.h"
 #include "compat.h"
 #include "util.h"
+#include "version.h"
 
 #define DEFAULT_SOCKWAIT 60
 
@@ -103,6 +107,17 @@ static void databuf_free(struct data_buffer *db)
 
 	memset(db, 0, sizeof(*db));
 }
+
+struct json_rpc_call_state {
+	struct data_buffer all_data;
+	struct header_info hi;
+	void *priv;
+	char curl_err_str[CURL_ERROR_SIZE];
+	struct curl_slist *headers;
+	struct upload_buffer upload_data;
+	struct pool *pool;
+	bool longpoll;
+};
 
 // aka data_buffer_write
 static size_t all_data_cb(const void *ptr, size_t size, size_t nmemb,
@@ -151,8 +166,15 @@ static size_t all_data_cb(const void *ptr, size_t size, size_t nmemb,
 static size_t upload_data_cb(void *ptr, size_t size, size_t nmemb,
 			     void *user_data)
 {
-	struct upload_buffer *ub = user_data;
+	struct json_rpc_call_state * const state = user_data;
+	struct upload_buffer * const ub = &state->upload_data;
 	unsigned int len = size * nmemb;
+	
+	if (state->longpoll)
+	{
+		struct pool * const pool = state->pool;
+		pool->lp_active = true;
+	}
 
 	if (len > ub->len)
 		len = ub->len;
@@ -314,6 +336,22 @@ static int keep_sockalive(SOCKETTYPE fd)
 	return ret;
 }
 
+void set_cloexec_socket(SOCKETTYPE sock, const bool cloexec)
+{
+#ifdef WIN32
+	SetHandleInformation((HANDLE)sock, HANDLE_FLAG_INHERIT, cloexec ? 0 : HANDLE_FLAG_INHERIT);
+#elif defined(F_GETFD) && defined(F_SETFD) && defined(O_CLOEXEC)
+	const int curflags = fcntl(sock, F_GETFD);
+	int flags = curflags;
+	if (cloexec)
+		flags |= FD_CLOEXEC;
+	else
+		flags &= ~FD_CLOEXEC;
+	if (flags != curflags)
+		fcntl(sock, F_SETFD, flags);
+#endif
+}
+
 int json_rpc_call_sockopt_cb(void __maybe_unused *userdata, curl_socket_t fd,
 			     curlsocktype __maybe_unused purpose)
 {
@@ -377,16 +415,6 @@ static int curl_debug_cb(__maybe_unused CURL *handle, curl_infotype type,
 	return 0;
 }
 
-struct json_rpc_call_state {
-	struct data_buffer all_data;
-	struct header_info hi;
-	void *priv;
-	char curl_err_str[CURL_ERROR_SIZE];
-	struct curl_slist *headers;
-	struct upload_buffer upload_data;
-	struct pool *pool;
-};
-
 void json_rpc_call_async(CURL *curl, const char *url,
 		      const char *userpass, const char *rpc_req,
 		      bool longpoll,
@@ -403,7 +431,10 @@ void json_rpc_call_async(CURL *curl, const char *url,
 	struct curl_slist *headers = NULL;
 
 	if (longpoll)
+	{
 		state->all_data.idlemarker = &pool->lp_socket;
+		state->longpoll = true;
+	}
 
 	/* it is assumed that 'curl' is freshly [re]initialized at this pt */
 
@@ -428,7 +459,7 @@ void json_rpc_call_async(CURL *curl, const char *url,
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state->all_data);
 	curl_easy_setopt(curl, CURLOPT_READFUNCTION, upload_data_cb);
-	curl_easy_setopt(curl, CURLOPT_READDATA, &state->upload_data);
+	curl_easy_setopt(curl, CURLOPT_READDATA, state);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, &state->curl_err_str[0]);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, resp_hdr_cb);
@@ -1326,8 +1357,7 @@ void _now_gettimeofday(struct timeval *tv)
 /* Windows start time is since 1601 lol so convert it to unix epoch 1970. */
 #define EPOCHFILETIME (116444736000000000LL)
 
-/* Return the system time as an lldiv_t in decimicroseconds. */
-static void decius_time(lldiv_t *lidiv)
+void _now_gettimeofday(struct timeval *tv)
 {
 	FILETIME ft;
 	LARGE_INTEGER li;
@@ -1338,16 +1368,8 @@ static void decius_time(lldiv_t *lidiv)
 	li.QuadPart -= EPOCHFILETIME;
 
 	/* SystemTime is in decimicroseconds so divide by an unusual number */
-	*lidiv = lldiv(li.QuadPart, 10000000);
-}
-
-void _now_gettimeofday(struct timeval *tv)
-{
-	lldiv_t lidiv;
-
-	decius_time(&lidiv);
-	tv->tv_sec = lidiv.quot;
-	tv->tv_usec = lidiv.rem / 10;
+	tv->tv_sec  = li.QuadPart / 10000000;
+	tv->tv_usec = li.QuadPart % 10000000;
 }
 #endif
 
@@ -1403,33 +1425,45 @@ double tdiff(struct timeval *end, struct timeval *start)
 }
 
 
+int double_find_precision(double f, const double base)
+{
+	int rv = 0;
+	for ( ; floor(f) != f; ++rv)
+		f *= base;
+	return rv;
+}
+
+
+int utf8_len(const uint8_t b)
+{
+	if (!(b & 0x80))
+		return 1;
+	if (!(b & 0x20))
+		return 2;
+	else
+	if (!(b & 0x10))
+		return 3;
+	else
+		return 4;
+}
+
 int32_t utf8_decode(const void *b, int *out_len)
 {
 	int32_t w;
 	const unsigned char *s = b;
 	
-	if (!(s[0] & 0x80))
-	{
+	*out_len = utf8_len(s[0]);
+	
+	if (*out_len == 1)
 		// ASCII
-		*out_len = 1;
 		return s[0];
-	}
 	
 #ifdef STRICT_UTF8
 	if (unlikely(!(s[0] & 0x40)))
 		goto invalid;
-#endif
-	
-	if (!(s[0] & 0x20))
-		*out_len = 2;
-	else
-	if (!(s[0] & 0x10))
-		*out_len = 3;
-	else
-	if (likely(!(s[0] & 8)))
-		*out_len = 4;
-	else
+	if (unlikely(s[0] & 0x38 == 0x38))
 		goto invalid;
+#endif
 	
 	w = s[0] & ((2 << (6 - *out_len)) - 1);
 	for (int i = 1; i < *out_len; ++i)
@@ -1450,9 +1484,28 @@ int32_t utf8_decode(const void *b, int *out_len)
 	
 	return w;
 
+#ifdef STRICT_UTF8
 invalid:
 	*out_len = 1;
 	return REPLACEMENT_CHAR;
+#endif
+}
+
+size_t utf8_strlen(const void * const b)
+{
+	const uint8_t *s = b;
+	size_t c = 0;
+	int clen, i;
+	while (s[0])
+	{
+		clen = utf8_len(s[0]);
+		for (i = 0; i < clen; ++i)
+			if (!s[i])
+				clen = 1;
+		++c;
+		s += clen;
+	}
+	return c;
 }
 
 static
@@ -1460,6 +1513,17 @@ void _utf8_test(const char *s, const wchar_t expected, int expectedlen)
 {
 	int len;
 	wchar_t r;
+	
+	if (expected != REPLACEMENT_CHAR)
+	{
+		len = utf8_len(((uint8_t*)s)[0]);
+		if (len != expectedlen)
+			applog(LOG_ERR, "UTF-8 test U+%06lX (len %d) failed: got utf8_len=>%d", (unsigned long)expected, expectedlen, len);
+		len = utf8_strlen(s);
+		if (len != (s[0] ? 1 : 0))
+			applog(LOG_ERR, "UTF-8 test U+%06lX (len %d) failed: got utf8_strlen=>%d", (unsigned long)expected, expectedlen, len);
+		len = -1;
+	}
 	
 	r = utf8_decode(s, &len);
 	if (unlikely(r != expected || expectedlen != len))
@@ -1532,6 +1596,13 @@ bool extract_sockaddr(char *url, char **sockaddr_url, char **sockaddr_port)
 
 	if (url_len < 1)
 		return false;
+	
+	if (url_len >= sizeof(url_address))
+	{
+		applog(LOG_WARNING, "%s: Truncating overflowed address '%.*s'",
+		       __func__, url_len, url_begin);
+		url_len = sizeof(url_address) - 1;
+	}
 
 	sprintf(url_address, "%.*s", url_len, url_begin);
 
@@ -1572,22 +1643,21 @@ static enum send_ret __stratum_send(struct pool *pool, char *s, ssize_t len)
 
 	while (len > 0 ) {
 		struct timeval timeout = {1, 0};
-		ssize_t sent;
+		size_t sent = 0;
+		CURLcode rc;
 		fd_set wd;
-
+retry:
 		FD_ZERO(&wd);
 		FD_SET(sock, &wd);
-		if (select(sock + 1, NULL, &wd, NULL, &timeout) < 1)
+		if (select(sock + 1, NULL, &wd, NULL, &timeout) < 1) {
+			if (interrupted())
+				goto retry;
 			return SEND_SELECTFAIL;
-#ifdef __APPLE__
-		sent = send(pool->sock, s + ssent, len, SO_NOSIGPIPE);
-#elif WIN32
-		sent = send(pool->sock, s + ssent, len, 0);
-#else
-		sent = send(pool->sock, s + ssent, len, MSG_NOSIGNAL);
-#endif
-		if (sent < 0) {
-			if (!sock_blocks())
+		}
+		rc = curl_easy_send(pool->stratum_curl, s + ssent, len, &sent);
+		if (rc != CURLE_OK)
+		{
+			if (rc != CURLE_AGAIN)
 				return SEND_SENDFAIL;
 			sent = 0;
 		}
@@ -1670,14 +1740,13 @@ static void clear_sockbuf(struct pool *pool)
 
 static void clear_sock(struct pool *pool)
 {
-	ssize_t n;
+	size_t n = 0;
 
 	mutex_lock(&pool->stratum_lock);
 	do {
+		n = 0;
 		if (pool->sock)
-			n = recv(pool->sock, pool->sockbuf, RECVSIZE, 0);
-		else
-			n = 0;
+			curl_easy_recv(pool->stratum_curl, pool->sockbuf, RECVSIZE, &n);
 	} while (n > 0);
 	mutex_unlock(&pool->stratum_lock);
 
@@ -1725,23 +1794,24 @@ char *recv_line(struct pool *pool)
 		do {
 			char s[RBUFSIZE];
 			size_t slen;
-			ssize_t n;
+			size_t n = 0;
+			CURLcode rc;
 
 			memset(s, 0, RBUFSIZE);
-			n = recv(pool->sock, s, RECVSIZE, 0);
-			if (!n) {
+			rc = curl_easy_recv(pool->stratum_curl, s, RECVSIZE, &n);
+			if (rc == CURLE_OK && !n)
+			{
 				applog(LOG_DEBUG, "Socket closed waiting in recv_line");
 				suspend_stratum(pool);
 				break;
 			}
 			cgtime(&now);
 			waited = tdiff(&now, &rstart);
-			if (n < 0) {
-				//Save errno from being overweitten bei socket_ commands 
-				int socket_recv_errno;
-				socket_recv_errno = SOCKERR;
-				if (!sock_blocks() || !socket_full(pool, DEFAULT_SOCKWAIT - waited)) {
-					applog(LOG_DEBUG, "Failed to recv sock in recv_line: %s", bfg_strerror(socket_recv_errno, BST_SOCKET));
+			if (rc != CURLE_OK)
+			{
+				if (rc != CURLE_AGAIN || !socket_full(pool, DEFAULT_SOCKWAIT - waited))
+				{
+					applog(LOG_DEBUG, "Failed to recv sock in recv_line");
 					suspend_stratum(pool);
 					break;
 				}
@@ -1856,6 +1926,417 @@ static char *json_array_string(json_t *val, unsigned int entry)
 	return NULL;
 }
 
+void *my_memrchr(const void * const datap, const int c, const size_t sz)
+{
+	const uint8_t *data = datap;
+	const uint8_t *p = &data[sz];
+	while (p > data)
+		if (*--p == c)
+			return (void *)p;
+	return NULL;
+}
+
+bool isCalpha(const int c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return true;
+	if (c >= 'a' && c <= 'z')
+		return true;
+	return false;
+}
+
+static
+bool _appdata_file_call(const char * const appname, const char * const filename, const appdata_file_callback_t cb, void * const userp, const char * const path)
+{
+	if (!(path && path[0]))
+		return false;
+	char filepath[PATH_MAX];
+	snprintf(filepath, sizeof(filepath), "%s/%s/%s", path, appname, filename);
+	if (!access(filepath, R_OK))
+		return cb(filepath, userp);
+	return false;
+}
+
+#define _APPDATA_FILE_CALL(appname, path)  do{  \
+	if (_appdata_file_call(appname, filename, cb, userp, path))  \
+		return true;  \
+}while(0)
+
+bool appdata_file_call(const char *appname, const char * const filename, const appdata_file_callback_t cb, void * const userp)
+{
+	size_t appname_len = strlen(appname);
+	char appname_lcd[appname_len + 1];
+	appname_lcd[0] = '.';
+	char *appname_lc = &appname_lcd[1];
+	for (size_t i = 0; i <= appname_len; ++i)
+		appname_lc[i] = tolower(appname[i]);
+	appname_lc[appname_len] = '\0';
+	
+	const char * const HOME = getenv("HOME");
+	
+	_APPDATA_FILE_CALL(".", ".");
+	
+#ifdef WIN32
+	_APPDATA_FILE_CALL(appname, getenv("APPDATA"));
+#elif defined(__APPLE__)
+	if (HOME && HOME[0])
+	{
+		char AppSupport[strlen(HOME) + 28 + 1];
+		snprintf(AppSupport, sizeof(AppSupport), "%s/Library/Application Support", HOME);
+		_APPDATA_FILE_CALL(appname, AppSupport);
+	}
+#endif
+	
+	_APPDATA_FILE_CALL(appname_lcd, HOME);
+	
+#ifdef WIN32
+	_APPDATA_FILE_CALL(appname, getenv("ALLUSERSAPPDATA"));
+#elif defined(__APPLE__)
+	_APPDATA_FILE_CALL(appname, "/Library/Application Support");
+#endif
+#ifndef WIN32
+	_APPDATA_FILE_CALL(appname_lc, "/etc");
+#endif
+	
+	return false;
+}
+
+static
+bool _appdata_file_find_first(const char * const filepath, void *userp)
+{
+	char **rv = userp;
+	*rv = strdup(filepath);
+	return true;
+}
+
+char *appdata_file_find_first(const char * const appname, const char * const filename)
+{
+	char *rv;
+	if (appdata_file_call(appname, filename, _appdata_file_find_first, &rv))
+		return rv;
+	return NULL;
+}
+
+const char *get_registered_domain(size_t * const out_domainlen, const char * const fqdn, const size_t fqdnlen)
+{
+	const char *s;
+	int dots = 0;
+	
+	for (s = &fqdn[fqdnlen-1]; s >= fqdn; --s)
+	{
+		if (s[0] == '.')
+		{
+			*out_domainlen = fqdnlen - (&s[1] - fqdn);
+			if (++dots >= 2 && *out_domainlen > 5)
+				return &s[1];
+		}
+		else
+		if (!(dots || isCalpha(s[0])))
+		{
+			*out_domainlen = fqdnlen;
+			return fqdn;
+		}
+	}
+	
+	*out_domainlen = fqdnlen;
+	return fqdn;
+}
+
+const char *extract_domain(size_t * const out_domainlen, const char * const uri, const size_t urilen)
+{
+	const char *p = uri, *b, *q, *s;
+	bool alldigit;
+	
+	p = memchr(&p[1], '/', urilen - (&p[1] - uri));
+	if (p)
+	{
+		if (p[-1] == ':')
+		{
+			// part of the URI scheme, ignore it
+			while (p[0] == '/')
+				++p;
+			p = memchr(p, '/', urilen - (p - uri)) ?: &uri[urilen];
+		}
+	}
+	else
+		p = &uri[urilen];
+	
+	s = p;
+	q = my_memrchr(uri, ':', p - uri);
+	if (q)
+	{
+		alldigit = true;
+		for (q = b = &q[1]; q < p; ++q)
+			if (!isdigit(q[0]))
+			{
+				alldigit = false;
+				break;
+			}
+		if (alldigit && p != b)
+			p = &b[-1];
+	}
+	
+	alldigit = true;
+	for (b = uri; b < p; ++b)
+	{
+		if (b[0] == ':')
+			break;
+		if (alldigit && !isdigit(b[0]))
+			alldigit = false;
+	}
+	if ((b < p && b[0] == ':') && (b == uri || !alldigit))
+		b = &b[1];
+	else
+		b = uri;
+	while (b <= p && b[0] == '/')
+		++b;
+	if (p - b > 1 && b[0] == '[' && p[-1] == ']')
+	{
+		++b;
+		--p;
+	}
+	else
+	if (memchr(b, ':', p - b))
+		p = s;
+	if (p > b && p[-1] == '.')
+		--p;
+	
+	*out_domainlen = p - b;
+	return b;
+}
+
+bool match_domains(const char * const a, const size_t alen, const char * const b, const size_t blen)
+{
+	size_t a_domainlen, b_domainlen;
+	const char *a_domain, *b_domain;
+	a_domain = extract_domain(&a_domainlen, a, alen);
+	a_domain = get_registered_domain(&a_domainlen, a_domain, a_domainlen);
+	b_domain = extract_domain(&b_domainlen, b, blen);
+	b_domain = get_registered_domain(&b_domainlen, b_domain, b_domainlen);
+	if (a_domainlen != b_domainlen)
+		return false;
+	return !strncasecmp(a_domain, b_domain, a_domainlen);
+}
+
+static
+void _test_extract_domain(const char * const expect, const char * const uri)
+{
+	size_t sz;
+	const char * const d = extract_domain(&sz, uri, strlen(uri));
+	if (sz != strlen(expect) || strncasecmp(d, expect, sz))
+		applog(LOG_WARNING, "extract_domain \"%s\" test failed; got \"%.*s\" instead of \"%s\"",
+		       uri, (int)sz, d, expect);
+}
+
+static
+void _test_get_regd_domain(const char * const expect, const char * const fqdn)
+{
+	size_t sz;
+	const char * const d = get_registered_domain(&sz, fqdn, strlen(fqdn));
+	if (d == NULL || sz != strlen(expect) || strncasecmp(d, expect, sz))
+		applog(LOG_WARNING, "get_registered_domain \"%s\" test failed; got \"%.*s\" instead of \"%s\"",
+		       fqdn, (int)sz, d, expect);
+}
+
+void test_domain_funcs()
+{
+	_test_extract_domain("s.m.eligius.st", "http://s.m.eligius.st:3334");
+	_test_extract_domain("s.m.eligius.st", "http://s.m.eligius.st:3334/abc/abc/");
+	_test_extract_domain("s.m.eligius.st", "http://s.m.eligius.st/abc/abc/");
+	_test_extract_domain("s.m.eligius.st", "http://s.m.eligius.st");
+	_test_extract_domain("s.m.eligius.st", "http:s.m.eligius.st");
+	_test_extract_domain("s.m.eligius.st", "stratum+tcp:s.m.eligius.st");
+	_test_extract_domain("s.m.eligius.st", "stratum+tcp:s.m.eligius.st:3334");
+	_test_extract_domain("s.m.eligius.st", "stratum+tcp://s.m.eligius.st:3334");
+	_test_extract_domain("s.m.eligius.st", "stratum+tcp://s.m.eligius.st:3334///");
+	_test_extract_domain("s.m.eligius.st", "stratum+tcp://s.m.eligius.st.:3334///");
+	_test_extract_domain("s.m.eligius.st", "s.m.eligius.st:3334");
+	_test_extract_domain("s.m.eligius.st", "s.m.eligius.st:3334///");
+	_test_extract_domain("foohost", "foohost:3334");
+	_test_extract_domain("foohost", "foohost:3334///");
+	_test_extract_domain("foohost", "foohost:3334/abc.com//");
+	_test_extract_domain("", "foohost:");
+	_test_extract_domain("3334", "foohost://3334/abc.com//");
+	_test_extract_domain("192.0.2.0", "foohost:192.0.2.0");
+	_test_extract_domain("192.0.2.0", "192.0.2.0:3334");
+	_test_extract_domain("192.0.2.0", "192.0.2.0:3334///");
+	_test_extract_domain("2001:db8::1", "2001:db8::1");
+	_test_extract_domain("2001:db8::1", "http://[2001:db8::1]");
+	_test_extract_domain("2001:db8::1", "http:[2001:db8::1]");
+	_test_extract_domain("2001:db8::1", "http://[2001:db8::1]:42");
+	_test_extract_domain("2001:db8::1", "http://[2001:db8::1]:42/abc//def/ghi");
+	_test_extract_domain("2001:db8::cafe", "http://[2001:db8::cafe]");
+	_test_extract_domain("2001:db8::cafe", "http:[2001:db8::cafe]");
+	_test_extract_domain("2001:db8::cafe", "http://[2001:db8::cafe]:42");
+	_test_extract_domain("2001:db8::cafe", "http://[2001:db8::cafe]:42/abc//def/ghi");
+	_test_get_regd_domain("eligius.st", "s.m.eligius.st");
+	_test_get_regd_domain("eligius.st", "eligius.st");
+	_test_get_regd_domain("foohost.co.uk", "myserver.foohost.co.uk");
+	_test_get_regd_domain("foohost", "foohost");
+	_test_get_regd_domain("192.0.2.0", "192.0.2.0");
+	_test_get_regd_domain("2001:db8::1", "2001:db8::1");
+}
+
+struct bfg_strtobool_keyword {
+	bool val;
+	const char *keyword;
+};
+
+bool bfg_strtobool(const char * const s, char ** const endptr, __maybe_unused const int opts)
+{
+	struct bfg_strtobool_keyword keywords[] = {
+		{false, "false"},
+		{false, "never"},
+		{false, "none"},
+		{false, "off"},
+		{false, "no"},
+		{false, "0"},
+		
+		{true , "always"},
+		{true , "true"},
+		{true , "yes"},
+		{true , "on"},
+	};
+	
+	const int total_keywords = sizeof(keywords) / sizeof(*keywords);
+	for (int i = 0; i < total_keywords; ++i)
+	{
+		const size_t kwlen = strlen(keywords[i].keyword);
+		if (!strncasecmp(keywords[i].keyword, s, kwlen))
+		{
+			if (endptr)
+				*endptr = (char*)&s[kwlen];
+			return keywords[i].val;
+		}
+	}
+	
+	char *lend;
+	strtol(s, &lend, 0);
+	if (lend > s)
+	{
+		if (endptr)
+			*endptr = lend;
+		// Any number other than "0" is intentionally considered true, including 0x0
+		return true;
+	}
+	
+	*endptr = (char*)s;
+	return false;
+}
+
+#define URI_FIND_PARAM_FOUND ((const char *)uri_find_param)
+
+const char *uri_find_param(const char * const uri, const char * const param, bool * const invert_p)
+{
+	const char *start = strchr(uri, '#');
+	if (invert_p)
+		*invert_p = false;
+	if (!start)
+		return NULL;
+	const char *p = start;
+	++start;
+nextmatch:
+	p = strstr(&p[1], param);
+	if (!p)
+		return NULL;
+	const char *q = &p[strlen(param)];
+	if (isCalpha(q[0]))
+		goto nextmatch;
+	if (invert_p && p - start >= 2 && (!strncasecmp(&p[-2], "no", 2)) && !isCalpha(p[-3]))
+		*invert_p = true;
+	else
+	if (isCalpha(p[-1]))
+		goto nextmatch;
+	if (q[0] == '=')
+		return &q[1];
+	return URI_FIND_PARAM_FOUND;
+}
+
+enum bfg_tristate uri_get_param_bool2(const char * const uri, const char * const param)
+{
+	bool invert, foundval = true;
+	const char *q = uri_find_param(uri, param, &invert);
+	if (!q)
+		return BTS_UNKNOWN;
+	else
+	if (q != URI_FIND_PARAM_FOUND)
+	{
+		char *end;
+		bool v = bfg_strtobool(q, &end, 0);
+		if (end > q && !isCalpha(end[0]))
+			foundval = v;
+	}
+	if (invert)
+		foundval = !foundval;
+	return foundval;
+}
+
+bool uri_get_param_bool(const char * const uri, const char * const param, const bool defval)
+{
+	const enum bfg_tristate rv = uri_get_param_bool2(uri, param);
+	if (rv == BTS_UNKNOWN)
+		return defval;
+	return rv;
+}
+
+static
+void _test_uri_find_param(const char * const uri, const char * const param, const int expect_offset, const int expect_invert)
+{
+	bool invert;
+	const char *actual = uri_find_param(uri, param, (expect_invert >= 0) ? &invert : NULL);
+	int actual_offset;
+	if (actual == URI_FIND_PARAM_FOUND)
+		actual_offset = -1;
+	else
+	if (!actual)
+		actual_offset = -2;
+	else
+		actual_offset = actual - uri;
+	int actual_invert = (expect_invert >= 0) ? (invert ? 1 : 0) : -1;
+	if (actual_offset != expect_offset || expect_invert != actual_invert)
+		applog(LOG_WARNING, "%s(\"%s\", \"%s\", %s) test failed (offset: expect=%d actual=%d; invert: expect=%d actual=%d)",
+		       "uri_find_param", uri, param, (expect_invert >= 0) ? "(invert)" : "NULL",
+		       expect_offset, actual_offset,
+		       expect_invert, actual_invert);
+}
+
+static
+void _test_uri_get_param(const char * const uri, const char * const param, const bool defval, const bool expect)
+{
+	const bool actual = uri_get_param_bool(uri, param, defval);
+	if (actual != expect)
+		applog(LOG_WARNING, "%s(\"%s\", \"%s\", %s) test failed",
+		       "uri_get_param_bool", uri, param, defval ? "true" : "false");
+}
+
+void test_uri_get_param()
+{
+	_test_uri_find_param("stratum+tcp://footest/#redirect", "redirect", -1, -1);
+	_test_uri_find_param("stratum+tcp://footest/#redirectme", "redirect", -2, -1);
+	_test_uri_find_param("stratum+tcp://footest/#noredirect", "redirect", -2, -1);
+	_test_uri_find_param("stratum+tcp://footest/#noredirect", "redirect", -1, 1);
+	_test_uri_find_param("stratum+tcp://footest/#redirect", "redirect", -1, 0);
+	_test_uri_find_param("stratum+tcp://footest/#redirect=", "redirect", 32, -1);
+	_test_uri_find_param("stratum+tcp://footest/#noredirect=", "redirect", 34, 1);
+	_test_uri_get_param("stratum+tcp://footest/#redirect", "redirect", false, true);
+	_test_uri_get_param("stratum+tcp://footest/#redirectme", "redirect", false, false);
+	_test_uri_get_param("stratum+tcp://footest/#noredirect", "redirect", false, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=0", "redirect", false, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=1", "redirect", false, true);
+	_test_uri_get_param("stratum+tcp://footest/#redirect", "redirect", true, true);
+	_test_uri_get_param("stratum+tcp://footest/#redirectme", "redirect", true, true);
+	_test_uri_get_param("stratum+tcp://footest/#noredirect", "redirect", true, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=0", "redirect", true, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=1", "redirect", true, true);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=0,foo=1", "redirect", true, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=1,foo=0", "redirect", false, true);
+	_test_uri_get_param("stratum+tcp://footest/#foo=1,noredirect=0,foo=1", "redirect", false, true);
+	_test_uri_get_param("stratum+tcp://footest/#bar=0,noredirect=1,foo=0", "redirect", true, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=false", "redirect", true, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=no", "redirect", true, false);
+	_test_uri_get_param("stratum+tcp://footest/#redirect=yes", "redirect", false, true);
+}
+
 void stratum_probe_transparency(struct pool *pool)
 {
 	// Request transaction data to discourage pools from doing anything shady
@@ -1866,7 +2347,7 @@ void stratum_probe_transparency(struct pool *pool)
 	        pool->swork.job_id);
 	stratum_send(pool, s, sLen);
 	if ((!pool->swork.opaque) && !timer_isset(&pool->swork.tv_transparency))
-		cgtime(&pool->swork.tv_transparency);
+		timer_set_delay_from_now(&pool->swork.tv_transparency, 21093750L);
 	pool->swork.transparency_probed = true;
 }
 
@@ -1907,6 +2388,11 @@ static bool parse_notify(struct pool *pool, json_t *val)
 	cgtime(&pool->swork.tv_received);
 	free(pool->swork.job_id);
 	pool->swork.job_id = job_id;
+	if (pool->swork.tr)
+	{
+		tmpl_decref(pool->swork.tr);
+		pool->swork.tr = NULL;
+	}
 	pool->submit_old = !clean;
 	pool->swork.clean = true;
 	
@@ -1916,16 +2402,19 @@ static bool parse_notify(struct pool *pool, json_t *val)
 	pool->swork.ntime = be32toh(pool->swork.ntime);
 	hex2bin(&pool->swork.diffbits[0], nbit, 4);
 	
+	/* Nominally allow a driver to ntime roll 60 seconds */
+	set_simple_ntime_roll_limit(&pool->swork.ntime_roll_limits, pool->swork.ntime, 60);
+	
 	cb1_len = strlen(coinbase1) / 2;
 	pool->swork.nonce2_offset = cb1_len + pool->n1_len;
 	cb2_len = strlen(coinbase2) / 2;
 
-	bytes_resize(&pool->swork.coinbase, pool->swork.nonce2_offset + pool->n2size + cb2_len);
+	bytes_resize(&pool->swork.coinbase, pool->swork.nonce2_offset + pool->swork.n2size + cb2_len);
 	uint8_t *coinbase = bytes_buf(&pool->swork.coinbase);
 	hex2bin(coinbase, coinbase1, cb1_len);
-	hex2bin(&coinbase[cb1_len], pool->nonce1, pool->n1_len);
+	hex2bin(&coinbase[cb1_len], pool->swork.nonce1, pool->n1_len);
 	// NOTE: gap for nonce2, filled at work generation time
-	hex2bin(&coinbase[pool->swork.nonce2_offset + pool->n2size], coinbase2, cb2_len);
+	hex2bin(&coinbase[pool->swork.nonce2_offset + pool->swork.n2size], coinbase2, cb2_len);
 	
 	bytes_resize(&pool->swork.merkle_bin, 32 * merkles);
 	for (i = 0; i < merkles; i++)
@@ -1971,17 +2460,49 @@ static bool parse_diff(struct pool *pool, json_t *val)
 	if (diff == 0)
 		return false;
 
+	if ((int64_t)diff != diff)
+	{
+		// Assume fractional values are proper bdiff per specification
+		// Allow integers to be interpreted as pdiff, since the difference is trivial and some pools see it this way
+		diff = bdiff_to_pdiff(diff);
+	}
+	
+	if ((!opt_scrypt) && diff < 1 && diff > 0.999)
+		diff = 1;
+	
+#ifdef USE_SCRYPT
+	// Broken Scrypt pools multiply difficulty by 0x10000
+	const double broken_scrypt_diff_multiplier = 0x10000;
+
+	/* 7/12/2014: P2Pool code was fixed: https://github.com/forrestv/p2pool/pull/210
+	   7/15/2014: Popular pools unfixed: wemineltc, dogehouse, p2pool.org
+                  Cannot find a broken Scrypt pool that will dispense diff lower than 16 */
+
+	// Ideally pools will fix their implementation and we can remove this
+	// This should suffice until miners are hashing Scrypt at ~1-7 Gh/s (based on a share rate target of 10-60s)
+
+	const double minimum_broken_scrypt_diff = 16;
+	// Diff 16 at 1.15 Gh/s = 1 share / 60s
+	// Diff 16 at 7.00 Gh/s = 1 share / 10s
+
+	if (opt_scrypt && (diff >= minimum_broken_scrypt_diff))
+		diff /= broken_scrypt_diff_multiplier;
+#endif
+
 	cg_wlock(&pool->data_lock);
-	pool->swork.diff = diff;
+	set_target_to_pdiff(pool->swork.target, diff);
 	cg_wunlock(&pool->data_lock);
 
-	applog(LOG_DEBUG, "Pool %d stratum bdifficulty set to %f", pool->pool_no, diff);
+	applog(LOG_DEBUG, "Pool %d stratum difficulty set to %g", pool->pool_no, diff);
 
 	return true;
 }
 
 static bool parse_reconnect(struct pool *pool, json_t *val)
 {
+	if (opt_disable_client_reconnect)
+		return false;
+	
 	const char *url;
 	char address[256];
 	json_t *port_json;
@@ -1989,6 +2510,9 @@ static bool parse_reconnect(struct pool *pool, json_t *val)
 	url = __json_array_string(val, 0);
 	if (!url)
 		url = pool->sockaddr_url;
+	else
+	if (!pool_may_redirect_to(pool, url))
+		return false;
 
 	port_json = json_array_get(val, 1);
 	if (json_is_number(port_json))
@@ -2202,17 +2726,28 @@ out:
 curl_socket_t grab_socket_opensocket_cb(void *clientp, __maybe_unused curlsocktype purpose, struct curl_sockaddr *addr)
 {
 	struct pool *pool = clientp;
-	curl_socket_t sck = socket(addr->family, addr->socktype, addr->protocol);
+	curl_socket_t sck = bfg_socket(addr->family, addr->socktype, addr->protocol);
 	pool->sock = sck;
 	return sck;
 }
 
 static bool setup_stratum_curl(struct pool *pool)
 {
-	char curl_err_str[CURL_ERROR_SIZE];
 	CURL *curl = NULL;
 	char s[RBUFSIZE];
 	bool ret = false;
+	bool tls_only = false, try_tls = true;
+	bool tlsca = uri_get_param_bool(pool->rpc_url, "tlsca", false);
+	
+	{
+		const enum bfg_tristate tlsparam = uri_get_param_bool2(pool->rpc_url, "tls");
+		if (tlsparam != BTS_UNKNOWN)
+			try_tls = tls_only = tlsparam;
+		else
+		if (tlsca)
+			// If tlsca is enabled, require TLS by default
+			tls_only = true;
+	}
 
 	applog(LOG_DEBUG, "initiate_stratum with sockbuf=%p", pool->sockbuf);
 	mutex_lock(&pool->stratum_lock);
@@ -2237,14 +2772,10 @@ static bool setup_stratum_curl(struct pool *pool)
 		pool->sockbuf_size = RBUFSIZE;
 	}
 
-	/* Create a http url for use with curl */
-	sprintf(s, "http://%s:%s", pool->sockaddr_url, pool->stratum_port);
-
 	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30);
-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err_str);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, pool->curl_err_str);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
-	curl_easy_setopt(curl, CURLOPT_URL, s);
 	if (!opt_delaynet)
 		curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
 
@@ -2259,6 +2790,8 @@ static bool setup_stratum_curl(struct pool *pool)
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, pool);
 	
 	curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_TRY);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, (long)(tlsca ? 2 : 0));
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, (long)(tlsca ? 1 : 0));
 	if (pool->rpc_proxy) {
 		curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
 		curl_easy_setopt(curl, CURLOPT_PROXY, pool->rpc_proxy);
@@ -2268,9 +2801,28 @@ static bool setup_stratum_curl(struct pool *pool)
 		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
 	}
 	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
+	
+retry:
+	/* Create a http url for use with curl */
+	sprintf(s, "http%s://%s:%s", try_tls ? "s" : "",
+	        pool->sockaddr_url, pool->stratum_port);
+	curl_easy_setopt(curl, CURLOPT_URL, s);
+	
 	pool->sock = INVSOCK;
 	if (curl_easy_perform(curl)) {
-		applog(LOG_INFO, "Stratum connect failed to pool %d: %s", pool->pool_no, curl_err_str);
+		if (try_tls)
+		{
+			applog(LOG_DEBUG, "Stratum connect failed with TLS to pool %u: %s",
+			       pool->pool_no, pool->curl_err_str);
+			if (!tls_only)
+			{
+				try_tls = false;
+				goto retry;
+			}
+		}
+		else
+			applog(LOG_INFO, "Stratum connect failed to pool %d: %s",
+			       pool->pool_no, pool->curl_err_str);
 errout:
 		curl_easy_cleanup(curl);
 		pool->stratum_curl = NULL;
@@ -2427,7 +2979,8 @@ resend:
 		goto out;
 	}
 	n2size = json_integer_value(json_array_get(res_val, 2));
-	if (!n2size) {
+	if (n2size < 1)
+	{
 		applog(LOG_INFO, "Failed to get n2size in initiate_stratum");
 		free(sessionid);
 		free(nonce1);
@@ -2437,10 +2990,10 @@ resend:
 	cg_wlock(&pool->data_lock);
 	free(pool->sessionid);
 	pool->sessionid = sessionid;
-	free(pool->nonce1);
-	pool->nonce1 = nonce1;
+	free(pool->swork.nonce1);
+	pool->swork.nonce1 = nonce1;
 	pool->n1_len = strlen(nonce1) / 2;
-	pool->n2size = n2size;
+	pool->swork.n2size = n2size;
 	pool->nonce2sz  = (n2size > sizeof(pool->nonce2)) ? sizeof(pool->nonce2) : n2size;
 #ifdef WORDS_BIGENDIAN
 	pool->nonce2off = (n2size < sizeof(pool->nonce2)) ? (sizeof(pool->nonce2) - n2size) : 0;
@@ -2462,10 +3015,10 @@ out:
 		if (!pool->stratum_url)
 			pool->stratum_url = pool->sockaddr_url;
 		pool->stratum_active = true;
-		pool->swork.diff = 1;
+		set_target_to_pdiff(pool->swork.target, 1);
 		if (opt_protocol) {
 			applog(LOG_DEBUG, "Pool %d confirmed mining.subscribe with extranonce1 %s extran2size %d",
-			       pool->pool_no, pool->nonce1, pool->n2size);
+			       pool->pool_no, pool->swork.nonce1, pool->swork.n2size);
 		}
 	} else {
 		if (recvd)
@@ -2493,13 +3046,22 @@ out:
 
 bool restart_stratum(struct pool *pool)
 {
+	bool ret = true;
+	
+	mutex_lock(&pool->pool_test_lock);
+	
 	if (pool->stratum_active)
 		suspend_stratum(pool);
+	
 	if (!initiate_stratum(pool))
-		return false;
+		return_via(out, ret = false);
 	if (!auth_stratum(pool))
-		return false;
-	return true;
+		return_via(out, ret = false);
+	
+out:
+	mutex_unlock(&pool->pool_test_lock);
+	
+	return ret;
 }
 
 void dev_error_update(struct cgpu_info *dev, enum dev_reason reason)
@@ -2575,7 +3137,7 @@ bool sanechars[] = {
 	false, false, false, false, false, false, false, false,
 	false, false, false, false, false, false, false, false,
 	false, false, false, false, false, false, false, false,
-	false, false, false, false, false, false, false, false,
+	false, false, false, false, false, true , false, false,
 	true , true , true , true , true , true , true , true ,
 	true , true , false, false, false, false, false, false,
 	false, true , true , true , true , true , true , true ,
@@ -2638,6 +3200,7 @@ struct bfgtls_data {
 #ifdef NEED_BFG_LOWL_VCOM
 	struct detectone_meta_info_t __detectone_meta_info;
 #endif
+	unsigned probe_result_flags;
 };
 
 static
@@ -2683,6 +3246,11 @@ struct detectone_meta_info_t *_detectone_meta_info()
 	return &get_bfgtls()->__detectone_meta_info;
 }
 #endif
+
+unsigned *_bfg_probe_result_flags()
+{
+	return &get_bfgtls()->probe_result_flags;
+}
 
 void bfg_init_threadlocal()
 {
@@ -2812,11 +3380,11 @@ void notifier_init(notifier_t pipefd)
 #ifdef WIN32
 #define WindowsErrorStr(e)  bfg_strerror(e, BST_SOCKET)
 	SOCKET listener, connecter, acceptor;
-	listener = socket(AF_INET, SOCK_STREAM, 0);
+	listener = bfg_socket(AF_INET, SOCK_STREAM, 0);
 	if (listener == INVALID_SOCKET)
 		quit(1, "Failed to create listener socket"IN_FMT_FFL": %s",
 		     __FILE__, __func__, __LINE__, WindowsErrorStr(WSAGetLastError()));
-	connecter = socket(AF_INET, SOCK_STREAM, 0);
+	connecter = bfg_socket(AF_INET, SOCK_STREAM, 0);
 	if (connecter == INVALID_SOCKET)
 		quit(1, "Failed to create connect socket"IN_FMT_FFL": %s",
 		     __FILE__, __func__, __LINE__, WindowsErrorStr(WSAGetLastError()));

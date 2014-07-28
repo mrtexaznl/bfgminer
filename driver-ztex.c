@@ -1,6 +1,6 @@
 /*
  * Copyright 2012 nelisky
- * Copyright 2012-2013 Luke Dashjr
+ * Copyright 2012-2014 Luke Dashjr
  * Copyright 2012-2013 Denis Ahrens
  * Copyright 2012 Xiangfu
  *
@@ -89,6 +89,7 @@ bool ztex_lowl_probe(const struct lowlevel_device_info * const info)
 	const char * const serial = info->serial;
 	if (info->lowl != &lowl_usb)
 	{
+		bfg_probe_result_flags = BPR_WRONG_DEVTYPE;
 		applog(LOG_DEBUG, "%s: Matched \"%s\" serial \"%s\", but lowlevel driver is not usb!",
 		       __func__, product, serial);
 		return false;
@@ -374,7 +375,7 @@ static bool ztex_prepare(struct thr_info *thr)
 		thr->cgpu->deven = DEV_DISABLED;
 		return true;
 	}
-	ztex->dclk.freqM = ztex->dclk.freqMaxM+1;;
+	ztex->dclk.freqM = ztex->dclk.freqMaxM+1;
 	//ztex_updateFreq(thr);
 	libztex_setFreq(ztex, ztex->dclk.freqMDefault, cgpu->proc_repr);
 	ztex_releaseFpga(ztex);

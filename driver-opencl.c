@@ -1,6 +1,7 @@
 /*
- * Copyright 2011-2012 Con Kolivas
- * Copyright 2011-2013 Luke Dashjr
+ * Copyright 2011-2013 Con Kolivas
+ * Copyright 2011-2014 Luke Dashjr
+ * Copyright 2014 Nate Woolls
  * Copyright 2010 Jeff Garzik
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -259,6 +260,14 @@ load_opencl_symbols() {
 #endif
 
 
+typedef cl_int (*queue_kernel_parameters_func_t)(_clState *, struct work *, cl_uint);
+
+struct opencl_kernel_interface {
+	const char *kiname;
+	queue_kernel_parameters_func_t queue_kernel_parameters_func;
+};
+
+
 #ifdef HAVE_CURSES
 extern WINDOW *mainwin, *statuswin, *logwin;
 extern void enable_curses(void);
@@ -273,6 +282,7 @@ extern int gpur_thr_id;
 extern bool opt_noadl;
 extern bool have_opencl;
 static _clState *clStates[MAX_GPUDEVICES];
+static struct opencl_kernel_interface kernel_interfaces[];
 
 
 
@@ -369,7 +379,6 @@ _SET_INT_LIST(lookup_gap        , true, opt_lg )
 _SET_INT_LIST(thread_concurrency, true, opt_tc )
 #endif
 
-static
 enum cl_kernels select_kernel(const char * const arg)
 {
 	if (!strcmp(arg, "diablo"))
@@ -387,24 +396,66 @@ enum cl_kernels select_kernel(const char * const arg)
 	return KL_NONE;
 }
 
-static
-bool _set_kernel(struct cgpu_info * const cgpu, const char * const _val)
+const char *opencl_get_kernel_interface_name(const enum cl_kernels kern)
 {
-	const enum cl_kernels kern = select_kernel(_val);
-	if (kern == KL_NONE)
-		return false;
+	struct opencl_kernel_interface *ki = &kernel_interfaces[kern];
+	return ki->kiname;
+}
+
+static
+bool _set_kernel(struct cgpu_info * const cgpu, const char *_val)
+{
+	FILE *F;
 	struct opencl_device_data * const data = cgpu->device_data;
-	data->kernel = kern;
+	
+	size_t knamelen = strlen(_val);
+	char filename[knamelen + 3 + 1];
+	sprintf(filename, "%s.cl", _val);
+	
+	F = opencl_open_kernel(filename);
+	if (!F)
+		return false;
+	fclose(F);
+	
+	free(data->kernel_file);
+	data->kernel_file = strdup(_val);
+	
 	return true;
 }
 _SET_INTERFACE(kernel)
 const char *set_kernel(char *arg)
 {
-	if (opt_scrypt)
-		return "Cannot specify a kernel with scrypt";
 	return _set_list(arg, "Invalid value passed to set_kernel", _set_kernel);
 }
 #endif
+
+static
+const char *opencl_init_binary(struct cgpu_info * const proc, const char * const optname, const char * const newvalue, char * const replybuf, enum bfg_set_device_replytype * const out_success)
+{
+	struct opencl_device_data * const data = proc->device_data;
+	char *end;
+	bool nv;
+	
+	nv = bfg_strtobool(newvalue, &end, 0);
+	if (newvalue[0] && !end[0])
+		data->opt_opencl_binaries = nv ? OBU_LOADSAVE : OBU_NONE;
+	else
+	if (!(strcasecmp(newvalue, "load") && strcasecmp(newvalue, "read")))
+		data->opt_opencl_binaries = OBU_LOAD;
+	else
+	if (!(strcasecmp(newvalue, "save") && strcasecmp(newvalue, "write")))
+		data->opt_opencl_binaries = OBU_SAVE;
+	else
+	if (!(strcasecmp(newvalue, "both")))
+		data->opt_opencl_binaries = OBU_LOADSAVE;
+	else
+	if (!(strcasecmp(newvalue, "default")))
+		data->opt_opencl_binaries = OBU_DEFAULT;
+	else
+		return "Invalid value passed to opencl binary";
+	
+	return NULL;
+}
 
 #ifdef HAVE_ADL
 /* This function allows us to map an adl device to an opencl device for when
@@ -1199,6 +1250,19 @@ cl_int queue_scrypt_kernel(_clState * const clState, struct work * const work, _
 #endif /* HAVE_OPENCL */
 
 
+static
+struct opencl_kernel_interface kernel_interfaces[] = {
+	{NULL},
+	{"poclbm",  queue_poclbm_kernel },
+	{"phatk",   queue_phatk_kernel  },
+	{"diakgcn", queue_diakgcn_kernel},
+	{"diablo",  queue_diablo_kernel },
+#ifdef USE_SCRYPT
+	{"scrypt",  queue_scrypt_kernel },
+#endif
+};
+
+
 #ifdef HAVE_OPENCL
 /* We have only one thread that ever re-initialises GPUs, thus if any GPU
  * init command fails due to a completely wedged GPU, the thread will never
@@ -1548,30 +1612,6 @@ static bool opencl_thread_prepare(struct thr_info *thr)
 	}
 	if (!cgpu->name)
 		cgpu->name = trimmed_strdup(name);
-	if (!cgpu->kname)
-	{
-		switch (clStates[i]->chosen_kernel) {
-			case KL_DIABLO:
-				cgpu->kname = "diablo";
-				break;
-			case KL_DIAKGCN:
-				cgpu->kname = "diakgcn";
-				break;
-			case KL_PHATK:
-				cgpu->kname = "phatk";
-				break;
-#ifdef USE_SCRYPT
-			case KL_SCRYPT:
-				cgpu->kname = "scrypt";
-				break;
-#endif
-			case KL_POCLBM:
-				cgpu->kname = "poclbm";
-				break;
-			default:
-				break;
-		}
-	}
 	applog(LOG_INFO, "initCl() finished. Found %s", name);
 	get_now_datestamp(cgpu->init, sizeof(cgpu->init));
 
@@ -1781,6 +1821,7 @@ static const struct bfg_set_device_definition opencl_set_device_funcs_probe[] = 
 	{"threads", opencl_init_gpu_threads},
 	{"vector", opencl_init_vector},
 	{"work_size", opencl_init_worksize},
+	{"binary", opencl_init_binary},
 #ifdef HAVE_ADL
 	{"adl_mapping", opencl_init_gpu_map},
 	{"clock", opencl_init_gpu_engine},
@@ -1805,6 +1846,7 @@ static const struct bfg_set_device_definition opencl_set_device_funcs[] = {
 	{"threads", opencl_cannot_set, "Number of threads"},
 	{"vector", opencl_cannot_set, ""},
 	{"work_size", opencl_cannot_set, ""},
+	{"binary", opencl_cannot_set, ""},
 #ifdef HAVE_ADL
 	{"adl_mapping", opencl_cannot_set, "Map to ADL device"},
 	{"clock", opencl_set_gpu_engine, "GPU engine clock"},

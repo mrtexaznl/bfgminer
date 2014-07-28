@@ -1,6 +1,6 @@
 /*
  * Copyright 2011-2013 Con Kolivas
- * Copyright 2012-2013 Luke Dashjr
+ * Copyright 2012-2014 Luke Dashjr
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -11,6 +11,7 @@
 #include "config.h"
 #ifdef HAVE_OPENCL
 
+#include <ctype.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,7 +32,10 @@
 #include "driver-opencl.h"
 #include "findnonce.h"
 #include "logging.h"
+#include "miner.h"
 #include "ocl.h"
+#include "sha2.h"
+#include "util.h"
 
 /* Platform API */
 extern
@@ -209,17 +213,10 @@ CL_API_ENTRY cl_int CL_API_CALL
                        cl_event *       /* event */) CL_API_SUFFIX__VERSION_1_0;
 
 int opt_platform_id = -1;
-#ifdef __APPLE__
-// Apple OpenCL doesn't like using binaries this way
-bool opt_opencl_binaries;
-#else
-bool opt_opencl_binaries = true;
-#endif
 
-char *file_contents(const char *filename, int *length)
+FILE *opencl_open_kernel(const char * const filename)
 {
 	char *fullpath = alloca(PATH_MAX);
-	void *buffer;
 	FILE *f;
 
 	/* Try in the optional kernel path or installed prefix first */
@@ -233,9 +230,19 @@ char *file_contents(const char *filename, int *length)
 	/* Finally try opening it directly */
 	if (!f)
 		f = fopen(filename, "rb");
+	
+	return f;
+}
+
+char *file_contents(const char *filename, int *length)
+{
+	void *buffer;
+	FILE *f;
+
+	f = opencl_open_kernel(filename);
 
 	if (!f) {
-		applog(LOG_ERR, "Unable to open %s or %s for reading", filename, fullpath);
+		applog(LOG_ERR, "Unable to open %s for reading", filename);
 		return NULL;
 	}
 
@@ -325,11 +332,33 @@ int clDevicesNum(void) {
 	}
 
 	if (opt_platform_id < 0)
-		opt_platform_id = mdplatform;;
+		opt_platform_id = mdplatform;
 	if (mdmesa && opt_g_threads == -1)
 		opt_g_threads = 1;
 
 	return most_devices;
+}
+
+cl_int bfg_clBuildProgram(_clState * const clState, const cl_device_id devid, const char * const CompilerOptions)
+{
+	cl_int status;
+	
+	status = clBuildProgram(clState->program, 1, &devid, CompilerOptions, NULL, NULL);
+	
+	if (status != CL_SUCCESS)
+	{
+		applog(LOG_ERR, "Error %d: Building Program (clBuildProgram)", status);
+		size_t logSize;
+		status = clGetProgramBuildInfo(clState->program, devid, CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
+		
+		char *log = malloc(logSize ?: 1);
+		status = clGetProgramBuildInfo(clState->program, devid, CL_PROGRAM_BUILD_LOG, logSize, log, NULL);
+		if (logSize > 0 && log[0])
+			applog(LOG_ERR, "%s", log);
+		free(log);
+	}
+	
+	return status;
 }
 
 static int advance(char **area, unsigned *remaining, const char *marker)
@@ -393,12 +422,12 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 {
 	_clState *clState = calloc(1, sizeof(_clState));
 	bool patchbfi = false, prog_built = false;
-	bool usebinary = opt_opencl_binaries, ismesa = false;
+	bool ismesa = false;
 	struct cgpu_info *cgpu = &gpus[gpu];
 	struct opencl_device_data * const data = cgpu->device_data;
 	cl_platform_id platform = NULL;
 	char pbuff[256], vbuff[255];
-	char *s;
+	char *s, *q;
 	cl_platform_id* platforms;
 	cl_uint preferred_vwidth;
 	cl_device_id *devices;
@@ -524,6 +553,7 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	find = strstr(extensions, camo);
 	if (find)
 		clState->hasBitAlign = true;
+	free(extensions);
 
 	/* Check for OpenCL >= 1.0 support, needed for global offset parameter usage. */
 	char * devoclver = malloc(1024);
@@ -537,6 +567,7 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	find = strstr(devoclver, ocl10);
 	if (!find)
 		clState->hasOpenCL11plus = true;
+	free(devoclver);
 
 	status = clGetDeviceInfo(devices[gpu], CL_DEVICE_PREFERRED_VECTOR_WIDTH_INT, sizeof(cl_uint), (void *)&preferred_vwidth, NULL);
 	if (status != CL_SUCCESS) {
@@ -573,12 +604,39 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	}
 	applog(LOG_DEBUG, "Max mem alloc size is %lu", (unsigned long)data->max_alloc);
 	
-	if (strstr(vbuff, "MESA"))
+	find = strstr(vbuff, "MESA");
+	if (find)
 	{
-		applog(LOG_DEBUG, "Mesa OpenCL platform detected, disabling OpenCL kernel binaries and bitalign");
-		clState->hasBitAlign = false;
-		usebinary = false;
+		long int major = strtol(&find[4], &s, 10), minor = 0;
+		if (!major)
+		{} // No version number at all
+		else
+		if (s[0] == '.')
+			minor = strtol(&s[1], NULL, 10);
+		if (major < 10 || (major == 10 && minor < 1))
+		{
+			if (data->opt_opencl_binaries == OBU_DEFAULT)
+			{
+				applog(LOG_DEBUG, "Mesa OpenCL platform detected (v%ld.%ld), disabling OpenCL kernel binaries and bitalign", major, minor);
+				data->opt_opencl_binaries = OBU_NONE;
+			}
+			else
+				applog(LOG_DEBUG, "Mesa OpenCL platform detected (v%ld.%ld), disabling bitalign", major, minor);
+			clState->hasBitAlign = false;
+		}
+		else
+			applog(LOG_DEBUG, "Mesa OpenCL platform detected (v%ld.%ld)", major, minor);
 		ismesa = true;
+	}
+	
+	if (data->opt_opencl_binaries == OBU_DEFAULT)
+	{
+#ifdef __APPLE__
+		// Apple OpenCL doesn't like using binaries this way
+		data->opt_opencl_binaries = OBU_NONE;
+#else
+		data->opt_opencl_binaries = OBU_LOADSAVE;
+#endif
 	}
 
 	/* Create binary filename based on parameters passed to opencl
@@ -592,7 +650,8 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	char filename[255];
 	char numbuf[32];
 
-	if (data->kernel == KL_NONE) {
+	if (!data->kernel_file)
+	{
 		if (opt_scrypt) {
 			applog(LOG_INFO, "Selecting scrypt kernel");
 			clState->chosen_kernel = KL_SCRYPT;
@@ -621,20 +680,61 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 			applog(LOG_INFO, "Selecting phatk kernel");
 			clState->chosen_kernel = KL_PHATK;
 		}
-		data->kernel = clState->chosen_kernel;
-	} else {
-		clState->chosen_kernel = data->kernel;
-		if (clState->chosen_kernel == KL_PHATK &&
-		    (strstr(vbuff, "844.4") || strstr(vbuff, "851.4") ||
-		     strstr(vbuff, "831.4") || strstr(vbuff, "898.1") ||
-		     strstr(vbuff, "923.1") || strstr(vbuff, "938.2") ||
-		     strstr(vbuff, "1113.2"))) {
-			applog(LOG_WARNING, "WARNING: You have selected the phatk kernel.");
-			applog(LOG_WARNING, "You are running SDK 2.6+ which performs poorly with this kernel.");
-			applog(LOG_WARNING, "Downgrade your SDK and delete any .bin files before starting again.");
-			applog(LOG_WARNING, "Or allow BFGMiner to automatically choose a more suitable kernel.");
-		}
+		data->kernel_file = strdup(opencl_get_kernel_interface_name(clState->chosen_kernel));
 	}
+	
+	snprintf(filename, sizeof(filename), "%s.cl", data->kernel_file);
+	snprintf(binaryfilename, sizeof(filename), "%s", data->kernel_file);
+	int pl;
+	char *source = file_contents(filename, &pl);
+	if (!source)
+		return NULL;
+	{
+		uint8_t hash[0x20];
+		char hashhex[7];
+		sha256((void*)source, pl, hash);
+		bin2hex(hashhex, hash, 3);
+		tailsprintf(binaryfilename, sizeof(binaryfilename), "-%s", hashhex);
+	}
+	s = strstr(source, "kernel-interface:");
+	if (s)
+	{
+		for (s = &s[17]; s[0] && isspace(s[0]); ++s)
+			if (s[0] == '\n' || s[0] == '\r')
+				break;
+		for (q = s; q[0] && !isspace(q[0]); ++q)
+		{}  // Find end of string
+		const size_t kinamelen = q - s;
+		char kiname[kinamelen + 1];
+		memcpy(kiname, s, kinamelen);
+		kiname[kinamelen] = '\0';
+		clState->chosen_kernel = select_kernel(kiname);
+	}
+	else
+	if (opt_scrypt)
+		clState->chosen_kernel = KL_SCRYPT;
+	switch (clState->chosen_kernel) {
+		case KL_NONE:
+			applog(LOG_ERR, "%s: Failed to identify kernel interface for %s",
+			       cgpu->dev_repr, data->kernel_file);
+			free(source);
+			return NULL;
+		case KL_PHATK:
+			if ((strstr(vbuff, "844.4") || strstr(vbuff, "851.4") ||
+			     strstr(vbuff, "831.4") || strstr(vbuff, "898.1") ||
+			     strstr(vbuff, "923.1") || strstr(vbuff, "938.2") ||
+			     strstr(vbuff, "1113.2"))) {
+				applog(LOG_WARNING, "WARNING: You have selected the phatk kernel.");
+				applog(LOG_WARNING, "You are running SDK 2.6+ which performs poorly with this kernel.");
+				applog(LOG_WARNING, "Downgrade your SDK and delete any .bin files before starting again.");
+				applog(LOG_WARNING, "Or allow BFGMiner to automatically choose a more suitable kernel.");
+			}
+		default:
+			;
+	}
+	applog(LOG_DEBUG, "%s: Using kernel %s with interface %s",
+	       cgpu->dev_repr, data->kernel_file,
+	       opencl_get_kernel_interface_name(clState->chosen_kernel));
 
 	/* For some reason 2 vectors is still better even if the card says
 	 * otherwise, and many cards lie about their max so use 256 as max
@@ -643,32 +743,6 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 		preferred_vwidth = 1;
 	else if (preferred_vwidth > 2)
 		preferred_vwidth = 2;
-
-	switch (clState->chosen_kernel) {
-		case KL_POCLBM:
-			strcpy(filename, POCLBM_KERNNAME".cl");
-			strcpy(binaryfilename, POCLBM_KERNNAME);
-			break;
-		case KL_PHATK:
-			strcpy(filename, PHATK_KERNNAME".cl");
-			strcpy(binaryfilename, PHATK_KERNNAME);
-			break;
-		case KL_DIAKGCN:
-			strcpy(filename, DIAKGCN_KERNNAME".cl");
-			strcpy(binaryfilename, DIAKGCN_KERNNAME);
-			break;
-		case KL_SCRYPT:
-			strcpy(filename, SCRYPT_KERNNAME".cl");
-			strcpy(binaryfilename, SCRYPT_KERNNAME);
-			/* Scrypt only supports vector 1 */
-			data->vwidth = 1;
-			break;
-		case KL_NONE: /* Shouldn't happen */
-		case KL_DIABLO:
-			strcpy(filename, DIABLO_KERNNAME".cl");
-			strcpy(binaryfilename, DIABLO_KERNNAME);
-			break;
-	}
 
 	if (data->vwidth)
 		clState->vwidth = data->vwidth;
@@ -718,15 +792,10 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	FILE *binaryfile;
 	size_t *binary_sizes;
 	char **binaries;
-	int pl;
-	char *source = file_contents(filename, &pl);
 	size_t sourceSize[] = {(size_t)pl};
 	cl_uint slot, cpnd;
 
 	slot = cpnd = 0;
-
-	if (!source)
-		return NULL;
 
 	binary_sizes = calloc(sizeof(size_t) * MAX_GPUDEVICES * 4, 1);
 	if (unlikely(!binary_sizes)) {
@@ -761,7 +830,7 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	applog(LOG_DEBUG, "OCL%2u: Configured OpenCL kernel name: %s", gpu, binaryfilename);
 	strcat(binaryfilename, ".bin");
 	
-	if (!usebinary)
+	if (!(data->opt_opencl_binaries & OBU_LOAD))
 		goto build;
 
 	binaryfile = fopen(binaryfilename, "rb");
@@ -863,8 +932,16 @@ build:
 		applog(LOG_DEBUG, "cl_amd_media_ops not found, will not set BITALIGN");
 
 	if (patchbfi) {
-		strcat(CompilerOptions, " -D BFI_INT");
-		applog(LOG_DEBUG, "BFI_INT patch requiring device found, patched source with BFI_INT");
+		if (data->opt_opencl_binaries == OBU_LOADSAVE)
+		{
+			strcat(CompilerOptions, " -D BFI_INT");
+			applog(LOG_DEBUG, "BFI_INT patch requiring device found, patched source with BFI_INT");
+		}
+		else
+		{
+			patchbfi = false;
+			applog(LOG_WARNING, "BFI_INT patch requiring device found, but OpenCL binary usage disabled; cannot BFI_INT patch");
+		}
 	} else
 		applog(LOG_DEBUG, "BFI_INT patch requiring device not found, will not BFI_INT patch");
 
@@ -875,23 +952,15 @@ build:
 		strcat(CompilerOptions, " -D OCL1");
 
 	applog(LOG_DEBUG, "CompilerOptions: %s", CompilerOptions);
-	status = clBuildProgram(clState->program, 1, &devices[gpu], CompilerOptions , NULL, NULL);
+	status = bfg_clBuildProgram(clState, devices[gpu], CompilerOptions);
 	free(CompilerOptions);
 
-	if (status != CL_SUCCESS) {
-		applog(LOG_ERR, "Error %d: Building Program (clBuildProgram)", status);
-		size_t logSize;
-		status = clGetProgramBuildInfo(clState->program, devices[gpu], CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
-
-		char *log = malloc(logSize);
-		status = clGetProgramBuildInfo(clState->program, devices[gpu], CL_PROGRAM_BUILD_LOG, logSize, log, NULL);
-		applog(LOG_ERR, "%s", log);
+	if (status != CL_SUCCESS)
 		return NULL;
-	}
 
 	prog_built = true;
 	
-	if (!usebinary)
+	if (!(data->opt_opencl_binaries & OBU_SAVE))
 		goto built;
 
 	status = clGetProgramInfo(clState->program, CL_PROGRAM_NUM_DEVICES, sizeof(cl_uint), &cpnd, NULL);
@@ -1002,17 +1071,9 @@ built:
 
 	if (!prog_built) {
 		/* create a cl program executable for all the devices specified */
-		status = clBuildProgram(clState->program, 1, &devices[gpu], NULL, NULL, NULL);
-		if (status != CL_SUCCESS) {
-			applog(LOG_ERR, "Error %d: Building Program (clBuildProgram)", status);
-			size_t logSize;
-			status = clGetProgramBuildInfo(clState->program, devices[gpu], CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
-
-			char *log = malloc(logSize);
-			status = clGetProgramBuildInfo(clState->program, devices[gpu], CL_PROGRAM_BUILD_LOG, logSize, log, NULL);
-			applog(LOG_ERR, "%s", log);
+		status = bfg_clBuildProgram(clState, devices[gpu], NULL);
+		if (status != CL_SUCCESS)
 			return NULL;
-		}
 	}
 
 	/* get a kernel object handle for a kernel with the given name */
@@ -1021,6 +1082,9 @@ built:
 		applog(LOG_ERR, "Error %d: Creating Kernel from program. (clCreateKernel)", status);
 		return NULL;
 	}
+	
+	free((void*)cgpu->kname);
+	cgpu->kname = strdup(data->kernel_file);
 
 #ifdef USE_SCRYPT
 	if (opt_scrypt) {

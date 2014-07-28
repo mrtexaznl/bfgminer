@@ -1,7 +1,8 @@
-# Copyright 2012-2013 Luke Dashjr
+# Copyright 2012-2014 Luke Dashjr
 # Copyright 2012 zefir
 # Copyright 2011-2013 Con Kolivas
 # Copyright 2013 James Z.M. Gao
+# Copyright 2013-2014 Nate Woolls
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -40,6 +41,13 @@ INCLUDES	= -fno-strict-aliasing
 
 bin_PROGRAMS	= bfgminer
 
+sbin_SCRIPTS =
+
+if HAVE_WINDOWS
+else
+bin_SCRIPTS = start-bfgminer.sh
+endif
+
 bfgminer_LDFLAGS	= $(PTHREAD_FLAGS)
 bfgminer_LDADD	= $(DLOPEN_FLAGS) @LIBCURL_LIBS@ @JANSSON_LIBS@ @PTHREAD_LIBS@ \
 		  @NCURSES_LIBS@ @PDCURSES_LIBS@ @WS2_LIBS@ \
@@ -70,8 +78,17 @@ bfgminer_SOURCES += miner.h compat.h  \
 		   sha2.c sha2.h api.c
 EXTRA_bfgminer_DEPENDENCIES =
 
+.PHONY: update-version
+update-version:
+	./gen-version.sh >version.h.new
+	cmp version.h version.h.new && rm version.h.new || mv version.h.new version.h
+version.h: update-version
+bfgminer_SOURCES += version.h
+
+SUBDIRS += $(LIBBLKMAKER_SUBDIRS)
+LIBBLKMAKER_SUBDIRS =
 if NEED_LIBBLKMAKER
-SUBDIRS           += libblkmaker
+LIBBLKMAKER_SUBDIRS         += libblkmaker
 EXTRA_bfgminer_DEPENDENCIES += libblkmaker_directory
 libblkmaker_directory:
 	cd libblkmaker && $(MAKE)
@@ -114,10 +131,10 @@ if HAVE_OPENCL
 bfgminer_SOURCES += driver-opencl.h driver-opencl.c
 bfgminer_SOURCES += ocl.c ocl.h findnonce.c findnonce.h
 bfgminer_SOURCES += adl.c adl.h adl_functions.h
-bfgminer_SOURCES += *.cl
+bfgminer_SOURCES += opencl/*.cl
 
 kernelsdir = $(pkgdatadir)/opencl
-dist_kernels_DATA = $(top_srcdir)/*.cl
+dist_kernels_DATA = $(top_srcdir)/opencl/*.cl
 
 dist_doc_DATA += README.GPU
 
@@ -143,7 +160,6 @@ bfgminer_SOURCES	+= \
 
 # the CPU portion extracted from original main.c
 bfgminer_SOURCES += driver-cpu.h driver-cpu.c
-bfgminer_SOURCES += bench_block.h
 
 if HAVE_SSE2
 bfgminer_LDADD  += libsse2cpuminer.a
@@ -198,6 +214,10 @@ if NEED_DYNCLOCK
 bfgminer_SOURCES += dynclock.c dynclock.h
 endif
 
+if NEED_BFG_WORK2D
+bfgminer_SOURCES  += work2d.c work2d.h
+endif
+
 if HAS_FPGA
 dist_doc_DATA += README.FPGA
 endif
@@ -229,10 +249,26 @@ bfgminer_SOURCES += driver-twinfury.c driver-twinfury.h
 endif
 
 if HAS_ICARUS
-bfgminer_SOURCES += driver-icarus.c icarus-common.h
+bfgminer_SOURCES += driver-icarus.c driver-icarus.h
 bfgminer_SOURCES += driver-cairnsmore.c
 bfgminer_SOURCES += driver-erupter.c
 bfgminer_SOURCES += driver-antminer.c
+endif
+
+if USE_GC3355
+bfgminer_SOURCES += gc3355.c gc3355.h
+endif
+
+if USE_GRIDSEED
+bfgminer_SOURCES += driver-gridseed.c
+endif
+
+if USE_DUALMINER
+bfgminer_SOURCES += driver-dualminer.c
+endif
+
+if USE_ZEUSMINER
+bfgminer_SOURCES += driver-zeusminer.c
 endif
 
 if HAS_AVALON
@@ -252,7 +288,7 @@ bfgminer_SOURCES += driver-modminer.c
 endif
 
 if HAS_X6500
-bfgminer_SOURCES += driver-x6500.c ft232r.c ft232r.h jtag.c jtag.h
+bfgminer_SOURCES += driver-x6500.c jtag.c jtag.h
 endif
 
 if HAS_ZTEX
@@ -264,10 +300,14 @@ bfgminer_SOURCES += driver-bifury.c
 endif
 
 if HAS_BITFURY
-bfgminer_SOURCES += driver-bitfury.c driver-bitfury.h libbitfury.c libbitfury.h spidevc.h spidevc.c
+bfgminer_SOURCES += driver-bitfury.c driver-bitfury.h libbitfury.c libbitfury.h
 
 if HAS_BFSB
 bfgminer_SOURCES += driver-bfsb.c
+endif
+
+if USE_BFX
+bfgminer_SOURCES += driver-bfx.c
 endif
 
 if HAS_METABANK
@@ -296,13 +336,38 @@ if USE_HASHFAST
 bfgminer_SOURCES += driver-hashfast.c
 endif
 
+if USE_JINGTIAN
+bfgminer_SOURCES += driver-aan.c driver-aan.h
+bfgminer_SOURCES += driver-jingtian.c
+endif
+
+if USE_ROCKMINER
+bfgminer_SOURCES += driver-rockminer.c
+endif
+
+if NEED_BFG_LOWL_FTDI
+bfgminer_SOURCES += lowl-ftdi.c lowl-ftdi.h
+endif
+
 if NEED_BFG_LOWL_HID
 bfgminer_SOURCES += lowl-hid.c lowl-hid.h
 bfgminer_CPPFLAGS += $(hidapi_CFLAGS)
 endif
 
+if NEED_BFG_LOWL_MSWIN
+bfgminer_SOURCES += lowl-mswin.c lowl-mswin.h
+endif
+
 if NEED_BFG_LOWL_PCI
 bfgminer_SOURCES += lowl-pci.c lowl-pci.h
+
+if USE_VFIO
+sbin_SCRIPTS += setup-vfio
+endif
+endif
+
+if NEED_BFG_LOWL_SPI
+bfgminer_SOURCES += lowl-spi.h lowl-spi.c
 endif
 
 bin_PROGRAMS += bfgminer-rpc
