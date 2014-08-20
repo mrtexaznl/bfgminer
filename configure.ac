@@ -14,7 +14,7 @@ dnl * any later version.  See COPYING for more details.
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_maj], [4])
-m4_define([v_min], [5])
+m4_define([v_min], [7])
 m4_define([v_mic], [0])
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_ver], [v_maj.v_min.v_mic])
@@ -253,6 +253,21 @@ AC_ARG_ENABLE([broad-udevrules],
 		fi
 	]
 )
+
+use_udevrules_group=true
+udevrules_group="video"
+AC_ARG_WITH([udevrules-group],
+	[AC_HELP_STRING([--with-udevrules-group=groupname],[Configure mining devices to be owned by a specific group (default `video')])],
+	[
+		if test "x$withval" = "xno"; then
+			use_udevrules_group=false
+		else
+			udevrules_group="$withval"
+		fi
+	]
+)
+AM_CONDITIONAL([USE_UDEVRULES_GROUP], [$use_udevrules_group])
+AC_SUBST([UDEVRULES_GROUP], [$udevrules_group])
 
 
 algolist="$algolist scrypt"
@@ -555,6 +570,22 @@ if test "x$avalon" = xyes; then
 	$broad_udevrules && have_udevrules=true
 fi
 AM_CONDITIONAL([HAS_AVALON], [test x$avalon = xyes])
+
+
+driverlist="$driverlist avalonmm"
+AC_ARG_ENABLE([avalonmm],
+	[AC_HELP_STRING([--disable-avalonmm],[Compile support for Avalon2/3 (default enabled)])],
+	[avalonmm=$enableval],
+	[avalonmm=$ddyes]
+	)
+if test "x$avalonmm" = xyes; then
+	AC_DEFINE([USE_AVALONMM], [1], [Defined to 1 if Avalon2/3 support is wanted])
+	need_lowl_vcom=yes
+	need_work2d=yes
+	has_asic=yes
+	$broad_udevrules && have_udevrules=true
+fi
+AM_CONDITIONAL([USE_AVALONMM], [test x$avalonmm = xyes])
 
 
 driverlist="$driverlist knc"
@@ -1095,6 +1126,19 @@ if test "x$metabank" = "xyes"; then
 	AC_DEFINE([USE_METABANK], [1], [Defined to 1 if Metabank support is wanted])
 fi
 AM_CONDITIONAL([HAS_METABANK], [test x$metabank = xyes])
+
+
+driverlist="$driverlist minergate"
+AC_ARG_ENABLE([minergate],
+	[AC_HELP_STRING([--enable-minergate],[Compile support for Spondoolies minergate interface (default disabled)])],
+	[minergate=$enableval],
+	[minergate=$ddno]
+	)
+if test "x$minergate" = "xyes"; then
+	AC_DEFINE([USE_MINERGATE], [1], [Defined to 1 if Spondoolies minergate interface support is wanted])
+	has_asic=yes
+fi
+AM_CONDITIONAL([USE_MINERGATE], [test x$minergate = xyes])
 
 
 driverlist="$driverlist rockminer"

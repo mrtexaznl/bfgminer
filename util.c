@@ -2396,6 +2396,19 @@ static bool parse_notify(struct pool *pool, json_t *val)
 	pool->submit_old = !clean;
 	pool->swork.clean = true;
 	
+	if (pool->next_nonce1)
+	{
+		free(pool->swork.nonce1);
+		pool->n1_len = strlen(pool->next_nonce1) / 2;
+		pool->swork.nonce1 = pool->next_nonce1;
+		pool->next_nonce1 = NULL;
+	}
+	int n2size = pool->swork.n2size = pool->next_n2size;
+	pool->nonce2sz  = (n2size > sizeof(pool->nonce2)) ? sizeof(pool->nonce2) : n2size;
+#ifdef WORDS_BIGENDIAN
+	pool->nonce2off = (n2size < sizeof(pool->nonce2)) ? (sizeof(pool->nonce2) - n2size) : 0;
+#endif
+	
 	hex2bin(&pool->swork.header1[0], bbversion,  4);
 	hex2bin(&pool->swork.header1[4], prev_hash, 32);
 	hex2bin((void*)&pool->swork.ntime, ntime, 4);
@@ -2421,6 +2434,9 @@ static bool parse_notify(struct pool *pool, json_t *val)
 		hex2bin(&bytes_buf(&pool->swork.merkle_bin)[i * 32], json_string_value(json_array_get(arr, i)), 32);
 	pool->swork.merkles = merkles;
 	pool->nonce2 = 0;
+	
+	memcpy(pool->swork.target, pool->next_target, 0x20);
+	
 	cg_wunlock(&pool->data_lock);
 
 	applog(LOG_DEBUG, "Received stratum notify from pool %u with job_id=%s",
@@ -2490,11 +2506,77 @@ static bool parse_diff(struct pool *pool, json_t *val)
 #endif
 
 	cg_wlock(&pool->data_lock);
-	set_target_to_pdiff(pool->swork.target, diff);
+	set_target_to_pdiff(pool->next_target, diff);
 	cg_wunlock(&pool->data_lock);
 
 	applog(LOG_DEBUG, "Pool %d stratum difficulty set to %g", pool->pool_no, diff);
 
+	return true;
+}
+
+static
+bool stratum_set_extranonce(struct pool * const pool, json_t * const val, json_t * const params)
+{
+	char *nonce1 = NULL;
+	int n2size = 0;
+	json_t *j;
+	
+	if (!json_is_array(params))
+		goto err;
+	switch (json_array_size(params))
+	{
+		default:  // >=2
+			// n2size
+			j = json_array_get(params, 1);
+			if (json_is_number(j))
+			{
+				n2size = json_integer_value(j);
+				if (n2size < 1)
+					goto err;
+			}
+			else
+			if (!json_is_null(j))
+				goto err;
+			// fallthru
+		case 1:
+			// nonce1
+			j = json_array_get(params, 0);
+			if (json_is_string(j))
+				nonce1 = strdup(json_string_value(j));
+			else
+			if (!json_is_null(j))
+				goto err;
+			break;
+		case 0:
+			applog(LOG_WARNING, "Pool %u: No-op mining.set_extranonce?", pool->pool_no);
+			return true;
+	}
+	
+	cg_wlock(&pool->data_lock);
+	if (nonce1)
+	{
+		free(pool->next_nonce1);
+		pool->next_nonce1 = nonce1;
+	}
+	if (n2size)
+		pool->next_n2size = n2size;
+	cg_wunlock(&pool->data_lock);
+	
+	return true;
+
+err:
+	applog(LOG_ERR, "Pool %u: Invalid mining.set_extranonce", pool->pool_no);
+	
+	json_t *id = json_object_get(val, "id");
+	if (id && !json_is_null(id))
+	{
+		char s[RBUFSIZE], *idstr;
+		idstr = json_dumps_ANY(id, 0);
+		sprintf(s, "{\"id\": %s, \"result\": null, \"error\": [20, \"Invalid params\"]}", idstr);
+		free(idstr);
+		stratum_send(pool, s, strlen(s));
+	}
+	
 	return true;
 }
 
@@ -2658,6 +2740,12 @@ bool parse_method(struct pool *pool, char *s)
 		ret = true;
 		goto out;
 	}
+	
+	if (!strncasecmp(buf, "mining.set_extranonce", 21) && stratum_set_extranonce(pool, val, params)) {
+		ret = true;
+		goto out;
+	}
+	
 out:
 	if (val)
 		json_decref(val);
@@ -2688,10 +2776,24 @@ bool auth_stratum(struct pool *pool)
 		if (parse_method(pool, sret))
 			free(sret);
 		else
-			break;
+		{
+			bool unknown = true;
+			val = JSON_LOADS(sret, &err);
+			json_t *j_id = json_object_get(val, "id");
+			if (json_is_string(j_id))
+			{
+				if (!strcmp(json_string_value(j_id), "auth"))
+					break;
+				else
+				if (!strcmp(json_string_value(j_id), "xnsub"))
+					unknown = false;
+			}
+			if (unknown)
+				applog(LOG_WARNING, "Pool %u: Unknown stratum msg: %s", pool->pool_no, sret);
+			free(sret);
+		}
 	}
 
-	val = JSON_LOADS(sret, &err);
 	free(sret);
 	res_val = json_object_get(val, "result");
 	err_val = json_object_get(val, "error");
@@ -2990,14 +3092,9 @@ resend:
 	cg_wlock(&pool->data_lock);
 	free(pool->sessionid);
 	pool->sessionid = sessionid;
-	free(pool->swork.nonce1);
-	pool->swork.nonce1 = nonce1;
-	pool->n1_len = strlen(nonce1) / 2;
-	pool->swork.n2size = n2size;
-	pool->nonce2sz  = (n2size > sizeof(pool->nonce2)) ? sizeof(pool->nonce2) : n2size;
-#ifdef WORDS_BIGENDIAN
-	pool->nonce2off = (n2size < sizeof(pool->nonce2)) ? (sizeof(pool->nonce2) - n2size) : 0;
-#endif
+	free(pool->next_nonce1);
+	pool->next_nonce1 = nonce1;
+	pool->next_n2size = n2size;
 	cg_wunlock(&pool->data_lock);
 
 	if (sessionid)
@@ -3015,10 +3112,16 @@ out:
 		if (!pool->stratum_url)
 			pool->stratum_url = pool->sockaddr_url;
 		pool->stratum_active = true;
-		set_target_to_pdiff(pool->swork.target, 1);
+		set_target_to_pdiff(pool->next_target, 1);
 		if (opt_protocol) {
 			applog(LOG_DEBUG, "Pool %d confirmed mining.subscribe with extranonce1 %s extran2size %d",
-			       pool->pool_no, pool->swork.nonce1, pool->swork.n2size);
+			       pool->pool_no, pool->next_nonce1, pool->next_n2size);
+		}
+		
+		if (uri_get_param_bool(pool->rpc_url, "xnsub", false))
+		{
+			sprintf(s, "{\"id\": \"xnsub\", \"method\": \"mining.extranonce.subscribe\", \"params\": []}");
+			_stratum_send(pool, s, strlen(s), true);
 		}
 	} else {
 		if (recvd)
@@ -3618,5 +3721,54 @@ uint8_t crc8ccitt(const void * const buf, const size_t buflen)
 	uint8_t crc = 0xff;
 	for (int i = 0; i < buflen; ++i)
 		crc = _crc8ccitt_table[crc ^ *p++];
+	return crc;
+}
+
+static uint16_t crc16tab[] = {
+	0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,
+	0x8108,0x9129,0xa14a,0xb16b,0xc18c,0xd1ad,0xe1ce,0xf1ef,
+	0x1231,0x0210,0x3273,0x2252,0x52b5,0x4294,0x72f7,0x62d6,
+	0x9339,0x8318,0xb37b,0xa35a,0xd3bd,0xc39c,0xf3ff,0xe3de,
+	0x2462,0x3443,0x0420,0x1401,0x64e6,0x74c7,0x44a4,0x5485,
+	0xa56a,0xb54b,0x8528,0x9509,0xe5ee,0xf5cf,0xc5ac,0xd58d,
+	0x3653,0x2672,0x1611,0x0630,0x76d7,0x66f6,0x5695,0x46b4,
+	0xb75b,0xa77a,0x9719,0x8738,0xf7df,0xe7fe,0xd79d,0xc7bc,
+	0x48c4,0x58e5,0x6886,0x78a7,0x0840,0x1861,0x2802,0x3823,
+	0xc9cc,0xd9ed,0xe98e,0xf9af,0x8948,0x9969,0xa90a,0xb92b,
+	0x5af5,0x4ad4,0x7ab7,0x6a96,0x1a71,0x0a50,0x3a33,0x2a12,
+	0xdbfd,0xcbdc,0xfbbf,0xeb9e,0x9b79,0x8b58,0xbb3b,0xab1a,
+	0x6ca6,0x7c87,0x4ce4,0x5cc5,0x2c22,0x3c03,0x0c60,0x1c41,
+	0xedae,0xfd8f,0xcdec,0xddcd,0xad2a,0xbd0b,0x8d68,0x9d49,
+	0x7e97,0x6eb6,0x5ed5,0x4ef4,0x3e13,0x2e32,0x1e51,0x0e70,
+	0xff9f,0xefbe,0xdfdd,0xcffc,0xbf1b,0xaf3a,0x9f59,0x8f78,
+	0x9188,0x81a9,0xb1ca,0xa1eb,0xd10c,0xc12d,0xf14e,0xe16f,
+	0x1080,0x00a1,0x30c2,0x20e3,0x5004,0x4025,0x7046,0x6067,
+	0x83b9,0x9398,0xa3fb,0xb3da,0xc33d,0xd31c,0xe37f,0xf35e,
+	0x02b1,0x1290,0x22f3,0x32d2,0x4235,0x5214,0x6277,0x7256,
+	0xb5ea,0xa5cb,0x95a8,0x8589,0xf56e,0xe54f,0xd52c,0xc50d,
+	0x34e2,0x24c3,0x14a0,0x0481,0x7466,0x6447,0x5424,0x4405,
+	0xa7db,0xb7fa,0x8799,0x97b8,0xe75f,0xf77e,0xc71d,0xd73c,
+	0x26d3,0x36f2,0x0691,0x16b0,0x6657,0x7676,0x4615,0x5634,
+	0xd94c,0xc96d,0xf90e,0xe92f,0x99c8,0x89e9,0xb98a,0xa9ab,
+	0x5844,0x4865,0x7806,0x6827,0x18c0,0x08e1,0x3882,0x28a3,
+	0xcb7d,0xdb5c,0xeb3f,0xfb1e,0x8bf9,0x9bd8,0xabbb,0xbb9a,
+	0x4a75,0x5a54,0x6a37,0x7a16,0x0af1,0x1ad0,0x2ab3,0x3a92,
+	0xfd2e,0xed0f,0xdd6c,0xcd4d,0xbdaa,0xad8b,0x9de8,0x8dc9,
+	0x7c26,0x6c07,0x5c64,0x4c45,0x3ca2,0x2c83,0x1ce0,0x0cc1,
+	0xef1f,0xff3e,0xcf5d,0xdf7c,0xaf9b,0xbfba,0x8fd9,0x9ff8,
+	0x6e17,0x7e36,0x4e55,0x5e74,0x2e93,0x3eb2,0x0ed1,0x1ef0,
+};
+
+static
+uint16_t crc16_floating(uint16_t next_byte, uint16_t seed)
+{
+	return ((seed << 8) ^ crc16tab[(seed >> 8) ^ next_byte]) & 0xFFFF;
+}
+
+uint16_t crc16(const void *p, size_t sz, uint16_t crc)
+{
+	const uint8_t * const s = p;
+	for (size_t i = 0; i < sz; ++i)
+		crc = crc16_floating(s[i], crc);
 	return crc;
 }

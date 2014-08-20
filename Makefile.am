@@ -84,6 +84,7 @@ update-version:
 	cmp version.h version.h.new && rm version.h.new || mv version.h.new version.h
 version.h: update-version
 bfgminer_SOURCES += version.h
+BUILT_SOURCES = version.h
 
 SUBDIRS += $(LIBBLKMAKER_SUBDIRS)
 LIBBLKMAKER_SUBDIRS =
@@ -228,12 +229,6 @@ endif
 
 if HAS_BITFORCE
 bfgminer_SOURCES += driver-bitforce.c
-
-if HAVE_WINDOWS
-else
-bin_PROGRAMS += bitforce-firmware-flash
-bitforce_firmware_flash_SOURCES = bitforce-firmware-flash.c
-endif
 endif
 
 if HAS_BIGPIC
@@ -273,6 +268,10 @@ endif
 
 if HAS_AVALON
 bfgminer_SOURCES += driver-avalon.c driver-avalon.h hexdump.c
+endif
+
+if USE_AVALONMM
+bfgminer_SOURCES += driver-avalonmm.c
 endif
 
 if USE_KNC
@@ -339,6 +338,10 @@ endif
 if USE_JINGTIAN
 bfgminer_SOURCES += driver-aan.c driver-aan.h
 bfgminer_SOURCES += driver-jingtian.c
+endif
+
+if USE_MINERGATE
+bfgminer_SOURCES += driver-minergate.c
 endif
 
 if USE_ROCKMINER

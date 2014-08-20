@@ -1064,8 +1064,6 @@ void adjust_quota_gcd(void)
 	applog(LOG_DEBUG, "Global quota greatest common denominator set to %lu", gcd);
 }
 
-static void enable_pool(struct pool *);
-
 /* Return value is ignored if not called from add_pool_details */
 struct pool *add_pool(void)
 {
@@ -1111,10 +1109,10 @@ struct pool *add_pool(void)
 	
 	adjust_quota_gcd();
 	
-	enable_pool(pool);
-	
 	if (!currentpool)
 		currentpool = pool;
+	
+	enable_pool(pool);
 
 	return pool;
 }
@@ -2790,7 +2788,8 @@ void free_work(struct work *work)
 	free(work);
 }
 
-static const char *workpadding_bin = "\0\0\0\x80\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x80\x02\0\0";
+const char *bfg_workpadding_bin = "\0\0\0\x80\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x80\x02\0\0";
+#define workpadding_bin  bfg_workpadding_bin
 
 // Must only be called with ch_lock held!
 static
@@ -4431,7 +4430,7 @@ void logwin_update(void)
 }
 #endif
 
-static void enable_pool(struct pool *pool)
+void enable_pool(struct pool * const pool)
 {
 	if (pool->enabled != POOL_ENABLED) {
 		mutex_lock(&lp_lock);
@@ -4439,23 +4438,32 @@ static void enable_pool(struct pool *pool)
 		pool->enabled = POOL_ENABLED;
 		pthread_cond_broadcast(&lp_cond);
 		mutex_unlock(&lp_lock);
+		if (pool->prio < current_pool()->prio)
+			switch_pools(pool);
 	}
 }
 
-#ifdef HAVE_CURSES
-static void disable_pool(struct pool *pool)
+void disable_pool(struct pool * const pool, const enum pool_enable enable_status)
 {
-	if (pool->enabled == POOL_ENABLED)
-		enabled_pools--;
-	pool->enabled = POOL_DISABLED;
-}
-#endif
-
-static void reject_pool(struct pool *pool)
-{
-	if (pool->enabled == POOL_ENABLED)
-		enabled_pools--;
-	pool->enabled = POOL_REJECTING;
+	if (pool->enabled == POOL_DISABLED)
+		/* had been manually disabled before */
+		return;
+	
+	if (pool->enabled != POOL_ENABLED)
+	{
+		/* has been programmatically disabled already, just change to the new status directly */
+		pool->enabled = enable_status;
+		return;
+	}
+	
+	/* Fall into the lock area */
+	mutex_lock(&lp_lock);
+	--enabled_pools;
+	pool->enabled = enable_status;
+	mutex_unlock(&lp_lock);
+	
+	if (pool == current_pool())
+		switch_pools(NULL);
 }
 
 static double share_diff(const struct work *);
@@ -4565,7 +4573,6 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 		if (unlikely(pool->enabled == POOL_REJECTING)) {
 			applog(LOG_WARNING, "Rejecting pool %d now accepting shares, re-enabling!", pool->pool_no);
 			enable_pool(pool);
-			switch_pools(NULL);
 		}
 
 		if (unlikely(work->block)) {
@@ -4645,9 +4652,7 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 			if (pool->seq_rejects > utility * 3) {
 				applog(LOG_WARNING, "Pool %d rejected %d sequential shares, disabling!",
 				       pool->pool_no, pool->seq_rejects);
-				reject_pool(pool);
-				if (pool == current_pool())
-					switch_pools(NULL);
+				disable_pool(pool, POOL_REJECTING);
 				pool->seq_rejects = 0;
 			}
 		}
@@ -6421,6 +6426,9 @@ void switch_pools(struct pool *selected)
 	struct pool *pool, *last_pool, *failover_pool = NULL;
 	int i, pool_no, next_pool;
 
+	if (selected)
+		enable_pool(selected);
+	
 	cg_wlock(&control_lock);
 	last_pool = currentpool;
 	pool_no = currentpool->pool_no;
@@ -6483,10 +6491,10 @@ void switch_pools(struct pool *selected)
 	if (pool_unusable(pool) && failover_pool)
 		pool = failover_pool;
 	currentpool = pool;
+	cg_wunlock(&control_lock);
 	mutex_lock(&lp_lock);
 	pthread_cond_broadcast(&lp_cond);
 	mutex_unlock(&lp_lock);
-	cg_wunlock(&control_lock);
 
 	/* Set the lagging flag to avoid pool not providing work fast enough
 	 * messages in failover only mode since  we have to get all fresh work
@@ -6939,6 +6947,8 @@ void remove_pool(struct pool *pool)
 	int i, last_pool = total_pools - 1;
 	struct pool *other;
 
+	disable_pool(pool, POOL_DISABLED);
+	
 	/* Boost priority of any lower prio than this one */
 	for (i = 0; i < total_pools; i++) {
 		other = pools[i];
@@ -7273,7 +7283,8 @@ void zero_stats(void)
 		cgpu->cgminer_stats.getwork_wait_max.tv_usec = 0;
 		mutex_unlock(&hash_lock);
 		
-		cgpu->drv->zero_stats(cgpu);
+		if (cgpu->drv->zero_stats)
+			cgpu->drv->zero_stats(cgpu);
 	}
 }
 
@@ -7368,7 +7379,6 @@ retry:
 			wlogprint("Unable to remove pool due to activity\n");
 			goto retry;
 		}
-		disable_pool(pool);
 		remove_pool(pool);
 		goto updated;
 	} else if (!strncasecmp(&input, "s", 1)) {
@@ -7379,7 +7389,6 @@ retry:
 		}
 		pool = pools[selected];
 		pool->failover_only = false;
-		enable_pool(pool);
 		switch_pools(pool);
 		goto updated;
 	} else if (!strncasecmp(&input, "d", 1)) {
@@ -7393,9 +7402,7 @@ retry:
 			goto retry;
 		}
 		pool = pools[selected];
-		disable_pool(pool);
-		if (pool == current_pool())
-			switch_pools(NULL);
+		disable_pool(pool, POOL_DISABLED);
 		goto updated;
 	} else if (!strncasecmp(&input, "e", 1)) {
 		selected = curses_int("Select pool number");
@@ -7406,8 +7413,6 @@ retry:
 		pool = pools[selected];
 		pool->failover_only = false;
 		enable_pool(pool);
-		if (pool->prio < current_pool()->prio)
-			switch_pools(pool);
 		goto updated;
 	} else if (!strncasecmp(&input, "c", 1)) {
 		for (i = 0; i <= TOP_STRATEGY; i++)
@@ -9708,7 +9713,7 @@ bool test_hash(const void * const phash, const float diff)
 		// FIXME: > 1 should check more
 		return !hash[7];
 	
-	const uint32_t Htarg = (uint32_t)(0x100000000 * diff) - 1;
+	const uint32_t Htarg = (uint32_t)ceil((1. / diff) - 1);
 	const uint32_t tmp_hash7 = le32toh(hash[7]);
 	
 	applog(LOG_DEBUG, "htarget %08lx hash %08lx",
@@ -9774,11 +9779,11 @@ enum test_nonce2_result _test_nonce2(struct work *work, uint32_t nonce, bool che
 		if (pool->stratum_active)
 		{
 			// Some stratum pools are buggy and expect difficulty changes to be immediate retroactively, so if the target has changed, check and submit just in case
-			if (memcmp(pool->swork.target, work->target, sizeof(work->target)))
+			if (memcmp(pool->next_target, work->target, sizeof(work->target)))
 			{
 				applog(LOG_DEBUG, "Stratum pool %u target has changed since work job issued, checking that too",
 				       pool->pool_no);
-				if (hash_target_check_v(work->hash, pool->swork.target))
+				if (hash_target_check_v(work->hash, pool->next_target))
 					high_hash = false;
 			}
 		}

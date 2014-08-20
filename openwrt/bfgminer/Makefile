@@ -11,7 +11,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=bfgminer
 PKG_TITLE:=BFGMiner
-PKG_VERSION:=4.5.0
+PKG_VERSION:=4.7.0
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).txz
@@ -120,24 +120,6 @@ define Package/$(PKG_NAME)/install
 endef
 
 ALL_$(PKG_NAME)_PACKAGES += $(PKG_NAME)
-
-#### BitForce firmware flash ####
-
-define Package/bitforce-firmware-flash
-$(call Package/$(PKG_NAME)/Default)
-	TITLE:=BitForce firmware flash tool
-endef
-
-define Package/bitforce-firmware-flash/description
-BitForce firmware flash tool
-endef
-
-define Package/bitforce-firmware-flash/install
-	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/bitforce-firmware-flash $(1)/usr/bin
-endef
-
-ALL_$(PKG_NAME)_PACKAGES += bitforce-firmware-flash
 
 
 $(foreach bitstream,$(ALL_$(PKG_NAME)_PACKAGES),$(eval $(call BuildPackage,$(bitstream))))

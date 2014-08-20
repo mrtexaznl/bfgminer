@@ -1644,6 +1644,7 @@ void bitforce_zero_stats(struct cgpu_info * const proc)
 	data->volts_count = 0;
 	data->temp[0] = data->temp[1] = 0;
 	free(data->volts);
+	data->volts = NULL;
 	
 	proc->avg_wait_f = 0;
 }
@@ -2612,12 +2613,14 @@ void bitforce_queue_flush(struct thr_info *thr)
 		// There is a race condition where the flush may have reported a job as in progress even though we completed and processed its results just now - so we just silence the sanity check
 		bitforce_queue_flush_sanity_check(thr, &processing, keysz, true);
 	
-final:
+final: ;
+#if 0
 	if (unlikely(inproc != -1 && inproc != data->queued))
 	{
 		applog(LOG_WARNING, "%"PRIpreprv": Sanity check: Device work inprogress count mismatch (dev inproc=%d, queued=%d)", bitforce->proc_repr, inproc, data->queued);
 		data->queued = inproc;
 	}
+#endif
 }
 
 static
