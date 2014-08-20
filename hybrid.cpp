@@ -70,16 +70,18 @@ struct ntime_roll_limits {
 	uint16_t maxoff;
 };
 
+typedef unsigned work_device_id_t;
+
 struct work {
 	unsigned char	data[128];
 	unsigned char	midstate[32];
 	unsigned char	target[32];
 	unsigned char	hash[32];
 
-	double	share_diff;
+	double share_diff;
 
 	int		rolls;
-	//int		drv_rolllimit; /* How much the driver can roll ntime */
+        struct ntime_roll_limits ntime_roll_limits;
 
 	struct {
 		uint32_t nonce;
@@ -102,12 +104,11 @@ struct work {
 	bool		stratum;
 	char 		*job_id;
 	bytes_t		nonce2;
-	double		sdiff;
 	char		*nonce1;
 
 	unsigned char	work_restart_id;
 	int		id;
-	int		device_id;
+	work_device_id_t device_id;
 	UT_hash_handle hh;
 
 	// Please don't use this if it's at all possible, I'd like to get rid of it eventually.
@@ -125,8 +126,7 @@ struct work {
 	// Allow devices to timestamp work for their own purposes
 	struct timeval	tv_stamp;
 
-	blktemplate_t	*tmpl;
-	int		*tmpl_refcount;
+	struct bfg_tmpl_ref *tr;
 	unsigned int	dataid;
 	bool		do_foreign_submit;
 
